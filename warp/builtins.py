@@ -259,6 +259,14 @@ add_builtin(
     doc="""Calculate the smallest integer that is greater than or equal to x.""",
 )
 
+add_builtin(
+    "isfinite",
+    input_types={"x": Float},
+    value_type=bool,
+    group="Utility",
+    doc="""Return True if x is finite""",
+)
+
 
 def infer_scalar_type(args):
     if args is None:
@@ -2539,6 +2547,19 @@ add_builtin(
     value_type=int,
     doc="Search a sorted array for the closest element greater than or equal to value.",
 )
+
+add_builtin(
+    "spd_project",
+    input_types={"n": int, "a": array(dtype=Float), "it_max": int},
+    value_type=None,
+    doc="Project a real symmetric matrix of at most 9x9 size to be positive semi-definite.")
+add_builtin(
+    "spd_project_blocks",
+    input_types={"n": int, "b": array(dtype=mat33, ndim=2), "it_max": int},
+    value_type=None,
+    doc="Project a real symmetric matrix of at most 9x9 size to be positive semi-definite. The matrix is stored in mat33 blocks."
+)
+
 
 # ---------------------------------
 # Operators
