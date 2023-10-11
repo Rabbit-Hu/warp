@@ -46,7 +46,6 @@ __device__ void __debugbreak() {}
 namespace wp
 {
 
-
 // numeric types (used from generated kernels)
 typedef float float32;
 typedef double float64;
@@ -141,7 +140,7 @@ static_assert(sizeof(half) == 2, "Size of half / float16 type must be 2-bytes");
 
 typedef half float16;
 
-#if __CUDA_ARCH__
+#if defined(__CUDA_ARCH__)
 
 CUDA_CALLABLE inline half float_to_half(float x)
 {
@@ -157,95 +156,38 @@ CUDA_CALLABLE inline float half_to_float(half x)
     return val;
 }
 
-#else
+#elif defined(__clang__)
 
-// adapted from Fabien Giesen's post: https://gist.github.com/rygorous/2156668
+// _Float16 is Clang's native half-precision floating-point type
 inline half float_to_half(float x)
 {
-    union fp32
-    {
-        uint32 u;
-        float f;
 
-        struct
-        {
-            unsigned int mantissa : 23;
-            unsigned int exponent : 8;
-            unsigned int sign : 1;
-        };
-    };
-
-    fp32 f;
-    f.f = x;
-
-    fp32 f32infty = { 255 << 23 };
-    fp32 f16infty = { 31 << 23 };
-    fp32 magic = { 15 << 23 };
-    uint32 sign_mask = 0x80000000u;
-    uint32 round_mask = ~0xfffu; 
-    half o;
-
-    uint32 sign = f.u & sign_mask;
-    f.u ^= sign;
-
-    // NOTE all the integer compares in this function can be safely
-    // compiled into signed compares since all operands are below
-    // 0x80000000. Important if you want fast straight SSE2 code
-    // (since there's no unsigned PCMPGTD).
-
-    if (f.u >= f32infty.u) // Inf or NaN (all exponent bits set)
-        o.u = (f.u > f32infty.u) ? 0x7e00 : 0x7c00; // NaN->qNaN and Inf->Inf
-    else // (De)normalized number or zero
-    {
-        f.u &= round_mask;
-        f.f *= magic.f;
-        f.u -= round_mask;
-        if (f.u > f16infty.u) f.u = f16infty.u; // Clamp to signed infinity if overflowed
-
-        o.u = f.u >> 13; // Take the bits!
-    }
-
-    o.u |= sign >> 16;
-    return o;
+    _Float16 f16 = static_cast<_Float16>(x);
+    return *reinterpret_cast<half*>(&f16);
 }
-
 
 inline float half_to_float(half h)
 {
-    union fp32
-    {
-        uint32 u;
-        float f;
-
-        struct
-        {
-            unsigned int mantissa : 23;
-            unsigned int exponent : 8;
-            unsigned int sign : 1;
-        };
-    };
-
-    static const fp32 magic = { 113 << 23 };
-    static const uint32 shifted_exp = 0x7c00 << 13; // exponent mask after shift
-    fp32 o;
-
-    o.u = (h.u & 0x7fff) << 13;     // exponent/mantissa bits
-    uint32 exp = shifted_exp & o.u;   // just the exponent
-    o.u += (127 - 15) << 23;        // exponent adjust
-
-    // handle exponent special cases
-    if (exp == shifted_exp) // Inf/NaN?
-        o.u += (128 - 16) << 23;    // extra exp adjust
-    else if (exp == 0) // Zero/Denormal?
-    {
-        o.u += 1 << 23;             // extra exp adjust
-        o.f -= magic.f;             // renormalize
-    }
-
-    o.u |= (h.u & 0x8000) << 16;    // sign bit
-    return o.f;
+    _Float16 f16 = *reinterpret_cast<_Float16*>(&h);
+    return static_cast<float>(f16);
 }
 
+#else  // Native C++ for Warp builtins outside of kernels
+
+extern "C" WP_API uint16_t float_to_half_bits(float x);
+extern "C" WP_API float half_bits_to_float(uint16_t u);
+
+inline half float_to_half(float x)
+{
+    half h;
+    h.u = float_to_half_bits(x);
+    return h;
+}
+
+inline float half_to_float(half h)
+{
+   return half_bits_to_float(h.u);
+}
 
 #endif
 
@@ -308,6 +250,8 @@ template <typename T>
 CUDA_CALLABLE inline void adj_int8(T, T&, int8) {}
 template <typename T>
 CUDA_CALLABLE inline void adj_uint8(T, T&, uint8) {}
+template <typename T>
+CUDA_CALLABLE inline void adj_bool(T, T&, bool) {}
 template <typename T>
 CUDA_CALLABLE inline void adj_int16(T, T&, int16) {}
 template <typename T>
@@ -788,16 +732,16 @@ inline CUDA_CALLABLE double floordiv(double a, double b)
 inline CUDA_CALLABLE float leaky_min(float a, float b, float r) { return min(a, b); }
 inline CUDA_CALLABLE float leaky_max(float a, float b, float r) { return max(a, b); }
 
-inline CUDA_CALLABLE half abs(half x) { return ::fabs(float(x)); }
-inline CUDA_CALLABLE float abs(float x) { return ::fabs(x); }
+inline CUDA_CALLABLE half abs(half x) { return ::fabsf(float(x)); }
+inline CUDA_CALLABLE float abs(float x) { return ::fabsf(x); }
 inline CUDA_CALLABLE double abs(double x) { return ::fabs(x); }
 
-inline CUDA_CALLABLE float acos(float x){ return ::acos(min(max(x, -1.0f), 1.0f)); }
-inline CUDA_CALLABLE float asin(float x){ return ::asin(min(max(x, -1.0f), 1.0f)); }
-inline CUDA_CALLABLE float atan(float x) { return ::atan(x); }
-inline CUDA_CALLABLE float atan2(float y, float x) { return ::atan2(y, x); }
-inline CUDA_CALLABLE float sin(float x) { return ::sin(x); }
-inline CUDA_CALLABLE float cos(float x) { return ::cos(x); }
+inline CUDA_CALLABLE float acos(float x){ return ::acosf(min(max(x, -1.0f), 1.0f)); }
+inline CUDA_CALLABLE float asin(float x){ return ::asinf(min(max(x, -1.0f), 1.0f)); }
+inline CUDA_CALLABLE float atan(float x) { return ::atanf(x); }
+inline CUDA_CALLABLE float atan2(float y, float x) { return ::atan2f(y, x); }
+inline CUDA_CALLABLE float sin(float x) { return ::sinf(x); }
+inline CUDA_CALLABLE float cos(float x) { return ::cosf(x); }
 
 inline CUDA_CALLABLE double acos(double x){ return ::acos(min(max(x, -1.0), 1.0)); }
 inline CUDA_CALLABLE double asin(double x){ return ::asin(min(max(x, -1.0), 1.0)); }
@@ -806,12 +750,12 @@ inline CUDA_CALLABLE double atan2(double y, double x) { return ::atan2(y, x); }
 inline CUDA_CALLABLE double sin(double x) { return ::sin(x); }
 inline CUDA_CALLABLE double cos(double x) { return ::cos(x); }
 
-inline CUDA_CALLABLE half acos(half x){ return ::acos(min(max(float(x), -1.0f), 1.0f)); }
-inline CUDA_CALLABLE half asin(half x){ return ::asin(min(max(float(x), -1.0f), 1.0f)); }
-inline CUDA_CALLABLE half atan(half x) { return ::atan(float(x)); }
-inline CUDA_CALLABLE half atan2(half y, half x) { return ::atan2(float(y), float(x)); }
-inline CUDA_CALLABLE half sin(half x) { return ::sin(float(x)); }
-inline CUDA_CALLABLE half cos(half x) { return ::cos(float(x)); }
+inline CUDA_CALLABLE half acos(half x){ return ::acosf(min(max(float(x), -1.0f), 1.0f)); }
+inline CUDA_CALLABLE half asin(half x){ return ::asinf(min(max(float(x), -1.0f), 1.0f)); }
+inline CUDA_CALLABLE half atan(half x) { return ::atanf(float(x)); }
+inline CUDA_CALLABLE half atan2(half y, half x) { return ::atan2f(float(y), float(x)); }
+inline CUDA_CALLABLE half sin(half x) { return ::sinf(float(x)); }
+inline CUDA_CALLABLE half cos(half x) { return ::cosf(float(x)); }
 
 
 inline CUDA_CALLABLE float sqrt(float x)
@@ -823,7 +767,7 @@ inline CUDA_CALLABLE float sqrt(float x)
         assert(0);
     }
 #endif
-    return ::sqrt(x);
+    return ::sqrtf(x);
 }
 inline CUDA_CALLABLE double sqrt(double x)
 {
@@ -845,10 +789,10 @@ inline CUDA_CALLABLE half sqrt(half x)
         assert(0);
     }
 #endif
-    return ::sqrt(float(x));
+    return ::sqrtf(float(x));
 }
 
-inline CUDA_CALLABLE float tan(float x) { return ::tan(x); }
+inline CUDA_CALLABLE float tan(float x) { return ::tanf(x); }
 inline CUDA_CALLABLE float sinh(float x) { return ::sinhf(x);}
 inline CUDA_CALLABLE float cosh(float x) { return ::coshf(x);}
 inline CUDA_CALLABLE float tanh(float x) { return ::tanhf(x);}
@@ -862,7 +806,7 @@ inline CUDA_CALLABLE double tanh(double x) { return ::tanh(x);}
 inline CUDA_CALLABLE double degrees(double x) { return x * RAD_TO_DEG;}
 inline CUDA_CALLABLE double radians(double x) { return x * DEG_TO_RAD;}
 
-inline CUDA_CALLABLE half tan(half x) { return ::tan(float(x)); }
+inline CUDA_CALLABLE half tan(half x) { return ::tanf(float(x)); }
 inline CUDA_CALLABLE half sinh(half x) { return ::sinhf(float(x));}
 inline CUDA_CALLABLE half cosh(half x) { return ::coshf(float(x));}
 inline CUDA_CALLABLE half tanh(half x) { return ::tanhf(float(x));}
@@ -1165,7 +1109,7 @@ inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j)
 {
     const size_t index = grid_index();
 
-    const int n = s_launchBounds.shape[1];
+    const size_t n = s_launchBounds.shape[1];
 
     // convert to work item
     i = index/n;
@@ -1176,8 +1120,8 @@ inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k)
 {
     const size_t index = grid_index();
 
-    const int n = s_launchBounds.shape[1];
-    const int o = s_launchBounds.shape[2];
+    const size_t n = s_launchBounds.shape[1];
+    const size_t o = s_launchBounds.shape[2];
 
     // convert to work item
     i = index/(n*o);
@@ -1189,9 +1133,9 @@ inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k, int& l)
 {
     const size_t index = grid_index();
 
-    const int n = s_launchBounds.shape[1];
-    const int o = s_launchBounds.shape[2];
-    const int p = s_launchBounds.shape[3];
+    const size_t n = s_launchBounds.shape[1];
+    const size_t o = s_launchBounds.shape[2];
+    const size_t p = s_launchBounds.shape[3];
 
     // convert to work item
     i = index/(n*o*p);
@@ -1203,11 +1147,11 @@ inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k, int& l)
 template<typename T>
 inline CUDA_CALLABLE T atomic_add(T* buf, T value)
 {
-#if defined(WP_CPU)
+#if !defined(__CUDA_ARCH__)
     T old = buf[0];
     buf[0] += value;
     return old;
-#elif defined(WP_CUDA)
+#else
     return atomicAdd(buf, value);
 #endif
 }
@@ -1215,11 +1159,14 @@ inline CUDA_CALLABLE T atomic_add(T* buf, T value)
 template<>
 inline CUDA_CALLABLE float16 atomic_add(float16* buf, float16 value)
 {
-#if defined(WP_CPU)
+#if !defined(__CUDA_ARCH__)
     float16 old = buf[0];
     buf[0] += value;
     return old;
-#elif defined(WP_CUDA)
+#elif defined(__clang__)  // CUDA compiled by Clang
+	__half r = atomicAdd(reinterpret_cast<__half*>(buf), *reinterpret_cast<__half*>(&value));
+    return *reinterpret_cast<float16*>(&r);
+#else  // CUDA compiled by NVRTC
     //return atomicAdd(buf, value);
     
     /* Define __PTR for atomicAdd prototypes below, undef after done */
@@ -1243,7 +1190,7 @@ inline CUDA_CALLABLE float16 atomic_add(float16* buf, float16 value)
 
     #undef __PTR
 
-#endif // defined(WP_CUDA)
+#endif  // CUDA compiled by NVRTC
 
 }
 
@@ -1528,7 +1475,7 @@ inline CUDA_CALLABLE void expect_near(const T& actual, const T& expected, const 
 {
     if (abs(actual - expected) > tolerance)
     {
-        printf("Error, expect_near() failed with torerance "); print(tolerance);
+        printf("Error, expect_near() failed with tolerance "); print(tolerance);
         printf("\t Expected: "); print(expected); 
         printf("\t Actual: "); print(actual);
     }
@@ -1539,7 +1486,7 @@ inline CUDA_CALLABLE void expect_near(const vec3& actual, const vec3& expected, 
     const float diff = max(max(abs(actual[0] - expected[0]), abs(actual[1] - expected[1])), abs(actual[2] - expected[2]));
     if (diff > tolerance)
     {
-        printf("Error, expect_near() failed with torerance "); print(tolerance);
+        printf("Error, expect_near() failed with tolerance "); print(tolerance);
         printf("\t Expected: "); print(expected); 
         printf("\t Actual: "); print(actual);
     }

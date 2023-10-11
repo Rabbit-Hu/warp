@@ -88,8 +88,11 @@ namespace wp
 
 const int ARRAY_MAX_DIMS = 4;       // must match constant in types.py
 
-const int ARRAY_TYPE_REGULAR = 0;   // must match constant in types.py
-const int ARRAY_TYPE_INDEXED = 1;   // must match constant in types.py
+// must match constants in types.py
+const int ARRAY_TYPE_REGULAR = 0;
+const int ARRAY_TYPE_INDEXED = 1;
+const int ARRAY_TYPE_FABRIC = 2;
+const int ARRAY_TYPE_FABRIC_INDEXED = 3;
 
 struct shape_t
 {
@@ -133,7 +136,7 @@ struct array_t
     CUDA_CALLABLE inline array_t() {}    
     CUDA_CALLABLE inline array_t(int) {} // for backward a = 0 initialization syntax
 
-    array_t(T* data, int size, T* grad=nullptr) : data(data), grad(grad) {
+    CUDA_CALLABLE array_t(T* data, int size, T* grad=nullptr) : data(data), grad(grad) {
         // constructor for 1d array
         shape.dims[0] = size;
         shape.dims[1] = 0;
@@ -145,7 +148,7 @@ struct array_t
         strides[2] = 0;
         strides[3] = 0;
     }
-    array_t(T* data, int dim0, int dim1, T* grad=nullptr) : data(data), grad(grad) {
+    CUDA_CALLABLE array_t(T* data, int dim0, int dim1, T* grad=nullptr) : data(data), grad(grad) {
         // constructor for 2d array
         shape.dims[0] = dim0;
         shape.dims[1] = dim1;
@@ -157,7 +160,7 @@ struct array_t
         strides[2] = 0;
         strides[3] = 0;
     }
-    array_t(T* data, int dim0, int dim1, int dim2, T* grad=nullptr) : data(data), grad(grad) {
+    CUDA_CALLABLE array_t(T* data, int dim0, int dim1, int dim2, T* grad=nullptr) : data(data), grad(grad) {
         // constructor for 3d array
         shape.dims[0] = dim0;
         shape.dims[1] = dim1;
@@ -169,7 +172,7 @@ struct array_t
         strides[2] = sizeof(T);
         strides[3] = 0;
     }
-    array_t(T* data, int dim0, int dim1, int dim2, int dim3, T* grad=nullptr) : data(data), grad(grad) {
+    CUDA_CALLABLE array_t(T* data, int dim0, int dim1, int dim2, int dim3, T* grad=nullptr) : data(data), grad(grad) {
         // constructor for 4d array
         shape.dims[0] = dim0;
         shape.dims[1] = dim1;
@@ -182,7 +185,7 @@ struct array_t
         strides[3] = sizeof(T);
     }
 
-    inline bool empty() const { return !data; }
+    CUDA_CALLABLE inline bool empty() const { return !data; }
 
     T* data{nullptr};
     T* grad{nullptr};
@@ -203,7 +206,7 @@ struct indexedarray_t
     CUDA_CALLABLE inline indexedarray_t() {}    
     CUDA_CALLABLE inline indexedarray_t(int) {} // for backward a = 0 initialization syntax
 
-    inline bool empty() const { return !arr.data; }
+    CUDA_CALLABLE inline bool empty() const { return !arr.data; }
 
     array_t<T> arr;
     int* indices[ARRAY_MAX_DIMS];  // index array per dimension (can be NULL)
@@ -597,13 +600,12 @@ inline CUDA_CALLABLE void adj_view(A1<T>& src, int i, int j, int k, A2<T>& adj_s
 // TODO: lower_bound() for indexed arrays?
 
 template <typename T>
-CUDA_CALLABLE inline int lower_bound(const array_t<T>& arr, T value)
+CUDA_CALLABLE inline int lower_bound(const array_t<T>& arr, int arr_begin, int arr_end, T value)
 {
     assert(arr.ndim == 1);
-    int n = arr.shape[0];
 
-    int lower = 0;
-    int upper = n - 1;
+    int lower = arr_begin;
+    int upper = arr_end - 1;
 
     while(lower < upper)
     {
@@ -622,7 +624,14 @@ CUDA_CALLABLE inline int lower_bound(const array_t<T>& arr, T value)
     return lower;
 }
 
+template <typename T>
+CUDA_CALLABLE inline int lower_bound(const array_t<T>& arr, T value)
+{
+    return lower_bound(arr, 0, arr.shape[0], value);
+}
+
 template <typename T> inline CUDA_CALLABLE void adj_lower_bound(const array_t<T>& arr, T value, array_t<T> adj_arr, T adj_value, int adj_ret) {}
+template <typename T> inline CUDA_CALLABLE void adj_lower_bound(const array_t<T>& arr, int arr_begin, int arr_end, T value, array_t<T> adj_arr, int adj_arr_begin, int adj_arr_end, T adj_value, int adj_ret) {}
 
 template<template<typename> class A, typename T>
 inline CUDA_CALLABLE T atomic_add(const A<T>& buf, int i, T value) { return atomic_add(&index(buf, i), value); }
@@ -730,6 +739,8 @@ CUDA_CALLABLE inline void adj_atomic_add(int32* buf, int32 value) { }
 CUDA_CALLABLE inline void adj_atomic_add(uint32* buf, uint32 value) { }
 CUDA_CALLABLE inline void adj_atomic_add(int64* buf, int64 value) { }
 CUDA_CALLABLE inline void adj_atomic_add(uint64* buf, uint64 value) { }
+
+CUDA_CALLABLE inline void adj_atomic_add(bool* buf, bool value) { }
 
 // only generate gradients for T types
 template<typename T>
@@ -914,3 +925,5 @@ template<template<typename> class A1, template<typename> class A2, typename T>
 inline CUDA_CALLABLE void adj_atomic_max(const A1<T>& buf, int i, int j, int k, int l, T value, const A2<T>& adj_buf, int& adj_i, int& adj_j, int& adj_k, int& adj_l, T& adj_value, const T& adj_ret) {}
 
 } // namespace wp
+
+#include "fabric.h"

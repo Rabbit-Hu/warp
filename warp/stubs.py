@@ -23,8 +23,9 @@ Array = Generic[DType]
 
 from warp.types import array, array1d, array2d, array3d, array4d, constant
 from warp.types import indexedarray, indexedarray1d, indexedarray2d, indexedarray3d, indexedarray4d
+from warp.fabric import fabricarray, fabricarrayarray, indexedfabricarray, indexedfabricarrayarray
 
-from warp.types import int8, uint8, int16, uint16, int32, uint32, int64, uint64, float16, float32, float64
+from warp.types import bool, int8, uint8, int16, uint16, int32, uint32, int64, uint64, float16, float32, float64
 from warp.types import vec2, vec2b, vec2ub, vec2s, vec2us, vec2i, vec2ui, vec2l, vec2ul, vec2h, vec2f, vec2d
 from warp.types import vec3, vec3b, vec3ub, vec3s, vec3us, vec3i, vec3ui, vec3l, vec3ul, vec3h, vec3f, vec3d
 from warp.types import vec4, vec4b, vec4ub, vec4s, vec4us, vec4i, vec4ui, vec4l, vec4ul, vec4h, vec4f, vec4d
@@ -44,7 +45,7 @@ from warp.types import matmul, adj_matmul, batched_matmul, adj_batched_matmul, f
 from warp.types import vector as vec
 from warp.types import matrix as mat
 
-from warp.context import init, func, kernel, struct, overload
+from warp.context import init, func, func_grad, func_replay, kernel, struct, overload
 from warp.context import is_cpu_available, is_cuda_available, is_device_available
 from warp.context import get_devices, get_preferred_device
 from warp.context import get_cuda_devices, get_cuda_device_count, get_cuda_device, map_cuda_device, unmap_cuda_device
@@ -52,6 +53,8 @@ from warp.context import get_device, set_device, synchronize_device
 from warp.context import (
     zeros,
     zeros_like,
+    full,
+    full_like,
     clone,
     empty,
     empty_like,
@@ -65,14 +68,14 @@ from warp.context import (
 from warp.context import set_module_options, get_module_options, get_module
 from warp.context import capture_begin, capture_end, capture_launch
 from warp.context import print_builtins, export_builtins, export_stubs
-from warp.context import Kernel, Function
+from warp.context import Kernel, Function, Launch
 from warp.context import Stream, get_stream, set_stream, synchronize_stream
 from warp.context import Event, record_event, wait_event, wait_stream
 from warp.context import RegisteredGLBuffer
 
 from warp.tape import Tape
-from warp.utils import ScopedTimer, ScopedCudaGuard, ScopedDevice, ScopedStream
-from warp.utils import transform_expand
+from warp.utils import ScopedTimer, ScopedDevice, ScopedStream
+from warp.utils import transform_expand, quat_between_vectors
 
 from warp.torch import from_torch, to_torch
 from warp.torch import device_from_torch, device_to_torch
@@ -86,6 +89,10 @@ from warp.dlpack import from_dlpack, to_dlpack
 from warp.constants import *
 
 from . import builtins
+
+import warp.config
+
+__version__ = warp.config.version
 
 
 @over
@@ -552,6 +559,14 @@ def diag(d: Vector[Any, Scalar]) -> Matrix[Any, Any, Scalar]:
 
 
 @over
+def get_diag(m: Matrix[Any, Any, Scalar]) -> Vector[Any, Scalar]:
+    """
+    Returns a vector containing the diagonal elements of the square matrix.
+    """
+    ...
+
+
+@over
 def cw_mul(x: Vector[Any, Scalar], y: Vector[Any, Scalar]) -> Vector[Any, Scalar]:
     """
     Component wise multiply of two 2d vectors.
@@ -867,6 +882,9 @@ def mesh_query_point(
     """
     Computes the closest point on the mesh with identifier `id` to the given point in space. Returns ``True`` if a point < ``max_dist`` is found.
 
+       Identifies the sign of the distance using additional ray-casts to determine if the point is inside or outside. This method is relatively robust, but
+       does increase computational cost. See below for additional sign determination methods.
+
        :param id: The mesh identifier
        :param point: The point in space to query
        :param max_dist: Mesh faces above this distance will not be considered by the query
@@ -874,6 +892,88 @@ def mesh_query_point(
        :param face: Returns the index of the closest face
        :param bary_u: Returns the barycentric u coordinate of the closest point
        :param bary_v: Returns the barycentric v coordinate of the closest point
+    """
+    ...
+
+
+@over
+def mesh_query_point_no_sign(
+    id: uint64, point: vec3f, max_dist: float32, face: int32, bary_u: float32, bary_v: float32
+) -> bool:
+    """
+    Computes the closest point on the mesh with identifier `id` to the given point in space. Returns ``True`` if a point < ``max_dist`` is found.
+
+       This method does not compute the sign of the point (inside/outside) which makes it faster than other point query methods.
+
+       :param id: The mesh identifier
+       :param point: The point in space to query
+       :param max_dist: Mesh faces above this distance will not be considered by the query
+       :param face: Returns the index of the closest face
+       :param bary_u: Returns the barycentric u coordinate of the closest point
+       :param bary_v: Returns the barycentric v coordinate of the closest point
+    """
+    ...
+
+
+@over
+def mesh_query_point_sign_normal(
+    id: uint64,
+    point: vec3f,
+    max_dist: float32,
+    inside: float32,
+    face: int32,
+    bary_u: float32,
+    bary_v: float32,
+    epsilon: float32,
+) -> bool:
+    """
+    Computes the closest point on the mesh with identifier `id` to the given point in space. Returns ``True`` if a point < ``max_dist`` is found.
+
+       Identifies the sign of the distance (inside/outside) using the angle-weighted pseudo normal. This approach to sign determination is robust for well conditioned meshes
+       that are watertight and non-self intersecting, it is also comparatively fast to compute.
+
+       :param id: The mesh identifier
+       :param point: The point in space to query
+       :param max_dist: Mesh faces above this distance will not be considered by the query
+       :param inside: Returns a value < 0 if query point is inside the mesh, >=0 otherwise. Note that mesh must be watertight for this to be robust
+       :param face: Returns the index of the closest face
+       :param bary_u: Returns the barycentric u coordinate of the closest point
+       :param bary_v: Returns the barycentric v coordinate of the closest point
+       :param epsilon: Epsilon treating distance values as equal, when locating the minimum distance vertex/face/edge, as a fraction of the average edge length, also for treating closest point as being on edge/vertex default 1e-3
+    """
+    ...
+
+
+@over
+def mesh_query_point_sign_winding_number(
+    id: uint64,
+    point: vec3f,
+    max_dist: float32,
+    inside: float32,
+    face: int32,
+    bary_u: float32,
+    bary_v: float32,
+    accuracy: float32,
+    threshold: float32,
+) -> bool:
+    """
+    Computes the closest point on the mesh with identifier `id` to the given point in space. Returns ``True`` if a point < ``max_dist`` is found.
+
+       Identifies the sign using the winding number of the mesh relative to the query point. This method of sign determination is robust for poorly conditioned meshes
+       and provides a smooth approximation to sign even when the mesh is not watertight. This method is the most robust and accurate of the sign determination meshes
+       but also the most expensive.
+
+        Note that the Mesh object must be constructed with ``suport_winding_number=True`` for this method to return correct results.
+
+       :param id: The mesh identifier
+       :param point: The point in space to query
+       :param max_dist: Mesh faces above this distance will not be considered by the query
+       :param inside: Returns a value < 0 if query point is inside the mesh, >=0 otherwise. Note that mesh must be watertight for this to be robust
+       :param face: Returns the index of the closest face
+       :param bary_u: Returns the barycentric u coordinate of the closest point
+       :param bary_v: Returns the barycentric v coordinate of the closest point
+       :param accuracy: Accuracy for computing the winding number with fast winding number method utilizing second order dipole approximation, default 2.0
+       :param threshold: The threshold of the winding number to be considered inside, default 0.5
     """
     ...
 
@@ -1040,6 +1140,14 @@ def closest_point_edge_edge(p1: vec3f, q1: vec3f, p2: vec3f, q2: vec3f, epsilon:
 def volume_sample_f(id: uint64, uvw: vec3f, sampling_mode: int32) -> float:
     """
     Sample the volume given by ``id`` at the volume local-space point ``uvw``. Interpolation should be ``wp.Volume.CLOSEST``, or ``wp.Volume.LINEAR.``
+    """
+    ...
+
+
+@over
+def volume_sample_grad_f(id: uint64, uvw: vec3f, sampling_mode: int32, grad: vec3f) -> float:
+    """
+    Sample the volume and its gradient given by ``id`` at the volume local-space point ``uvw``. Interpolation should be ``wp.Volume.CLOSEST``, or ``wp.Volume.LINEAR.``
     """
     ...
 
@@ -1427,6 +1535,14 @@ def select(cond: bool, arg1: Any, arg2: Any):
 
 
 @over
+def select(cond: bool, arg1: Any, arg2: Any):
+    """
+    Select between two arguments, if cond is false then return ``arg1``, otherwise return ``arg2``
+    """
+    ...
+
+
+@over
 def select(cond: int8, arg1: Any, arg2: Any):
     """
     Select between two arguments, if cond is false then return ``arg1``, otherwise return ``arg2``
@@ -1531,6 +1647,70 @@ def atomic_add(a: Array[Any], i: int32, j: int32, k: int32, l: int32, value: Any
 
 
 @over
+def atomic_add(a: FabricArray[Any], i: int32, value: Any):
+    """
+    Atomically add ``value`` onto the array at location given by index.
+    """
+    ...
+
+
+@over
+def atomic_add(a: FabricArray[Any], i: int32, j: int32, value: Any):
+    """
+    Atomically add ``value`` onto the array at location given by indices.
+    """
+    ...
+
+
+@over
+def atomic_add(a: FabricArray[Any], i: int32, j: int32, k: int32, value: Any):
+    """
+    Atomically add ``value`` onto the array at location given by indices.
+    """
+    ...
+
+
+@over
+def atomic_add(a: FabricArray[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
+    """
+    Atomically add ``value`` onto the array at location given by indices.
+    """
+    ...
+
+
+@over
+def atomic_add(a: IndexedFabricArray[Any], i: int32, value: Any):
+    """
+    Atomically add ``value`` onto the array at location given by index.
+    """
+    ...
+
+
+@over
+def atomic_add(a: IndexedFabricArray[Any], i: int32, j: int32, value: Any):
+    """
+    Atomically add ``value`` onto the array at location given by indices.
+    """
+    ...
+
+
+@over
+def atomic_add(a: IndexedFabricArray[Any], i: int32, j: int32, k: int32, value: Any):
+    """
+    Atomically add ``value`` onto the array at location given by indices.
+    """
+    ...
+
+
+@over
+def atomic_add(a: IndexedFabricArray[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
+    """
+    Atomically add ``value`` onto the array at location given by indices.
+    """
+    ...
+
+
+@over
 def atomic_sub(a: Array[Any], i: int32, value: Any):
     """
     Atomically subtract ``value`` onto the array at location given by index.
@@ -1556,6 +1736,70 @@ def atomic_sub(a: Array[Any], i: int32, j: int32, k: int32, value: Any):
 
 @over
 def atomic_sub(a: Array[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
+    """
+    Atomically subtract ``value`` onto the array at location given by indices.
+    """
+    ...
+
+
+@over
+def atomic_sub(a: FabricArray[Any], i: int32, value: Any):
+    """
+    Atomically subtract ``value`` onto the array at location given by index.
+    """
+    ...
+
+
+@over
+def atomic_sub(a: FabricArray[Any], i: int32, j: int32, value: Any):
+    """
+    Atomically subtract ``value`` onto the array at location given by indices.
+    """
+    ...
+
+
+@over
+def atomic_sub(a: FabricArray[Any], i: int32, j: int32, k: int32, value: Any):
+    """
+    Atomically subtract ``value`` onto the array at location given by indices.
+    """
+    ...
+
+
+@over
+def atomic_sub(a: FabricArray[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
+    """
+    Atomically subtract ``value`` onto the array at location given by indices.
+    """
+    ...
+
+
+@over
+def atomic_sub(a: IndexedFabricArray[Any], i: int32, value: Any):
+    """
+    Atomically subtract ``value`` onto the array at location given by index.
+    """
+    ...
+
+
+@over
+def atomic_sub(a: IndexedFabricArray[Any], i: int32, j: int32, value: Any):
+    """
+    Atomically subtract ``value`` onto the array at location given by indices.
+    """
+    ...
+
+
+@over
+def atomic_sub(a: IndexedFabricArray[Any], i: int32, j: int32, k: int32, value: Any):
+    """
+    Atomically subtract ``value`` onto the array at location given by indices.
+    """
+    ...
+
+
+@over
+def atomic_sub(a: IndexedFabricArray[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
     """
     Atomically subtract ``value`` onto the array at location given by indices.
     """
@@ -1595,6 +1839,70 @@ def atomic_min(a: Array[Any], i: int32, j: int32, k: int32, l: int32, value: Any
 
 
 @over
+def atomic_min(a: FabricArray[Any], i: int32, value: Any):
+    """
+    Compute the minimum of ``value`` and ``array[index]`` and atomically update the array. Note that for vectors and matrices the operation is only atomic on a per-component basis.
+    """
+    ...
+
+
+@over
+def atomic_min(a: FabricArray[Any], i: int32, j: int32, value: Any):
+    """
+    Compute the minimum of ``value`` and ``array[index]`` and atomically update the array. Note that for vectors and matrices the operation is only atomic on a per-component basis.
+    """
+    ...
+
+
+@over
+def atomic_min(a: FabricArray[Any], i: int32, j: int32, k: int32, value: Any):
+    """
+    Compute the minimum of ``value`` and ``array[index]`` and atomically update the array. Note that for vectors and matrices the operation is only atomic on a per-component basis.
+    """
+    ...
+
+
+@over
+def atomic_min(a: FabricArray[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
+    """
+    Compute the minimum of ``value`` and ``array[index]`` and atomically update the array. Note that for vectors and matrices the operation is only atomic on a per-component basis.
+    """
+    ...
+
+
+@over
+def atomic_min(a: IndexedFabricArray[Any], i: int32, value: Any):
+    """
+    Compute the minimum of ``value`` and ``array[index]`` and atomically update the array. Note that for vectors and matrices the operation is only atomic on a per-component basis.
+    """
+    ...
+
+
+@over
+def atomic_min(a: IndexedFabricArray[Any], i: int32, j: int32, value: Any):
+    """
+    Compute the minimum of ``value`` and ``array[index]`` and atomically update the array. Note that for vectors and matrices the operation is only atomic on a per-component basis.
+    """
+    ...
+
+
+@over
+def atomic_min(a: IndexedFabricArray[Any], i: int32, j: int32, k: int32, value: Any):
+    """
+    Compute the minimum of ``value`` and ``array[index]`` and atomically update the array. Note that for vectors and matrices the operation is only atomic on a per-component basis.
+    """
+    ...
+
+
+@over
+def atomic_min(a: IndexedFabricArray[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
+    """
+    Compute the minimum of ``value`` and ``array[index]`` and atomically update the array. Note that for vectors and matrices the operation is only atomic on a per-component basis.
+    """
+    ...
+
+
+@over
 def atomic_max(a: Array[Any], i: int32, value: Any):
     """
     Compute the maximum of ``value`` and ``array[index]`` and atomically update the array. Note that for vectors and matrices the operation is only atomic on a per-component basis.
@@ -1620,6 +1928,70 @@ def atomic_max(a: Array[Any], i: int32, j: int32, k: int32, value: Any):
 
 @over
 def atomic_max(a: Array[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
+    """
+    Compute the maximum of ``value`` and ``array[index]`` and atomically update the array. Note that for vectors and matrices the operation is only atomic on a per-component basis.
+    """
+    ...
+
+
+@over
+def atomic_max(a: FabricArray[Any], i: int32, value: Any):
+    """
+    Compute the maximum of ``value`` and ``array[index]`` and atomically update the array. Note that for vectors and matrices the operation is only atomic on a per-component basis.
+    """
+    ...
+
+
+@over
+def atomic_max(a: FabricArray[Any], i: int32, j: int32, value: Any):
+    """
+    Compute the maximum of ``value`` and ``array[index]`` and atomically update the array. Note that for vectors and matrices the operation is only atomic on a per-component basis.
+    """
+    ...
+
+
+@over
+def atomic_max(a: FabricArray[Any], i: int32, j: int32, k: int32, value: Any):
+    """
+    Compute the maximum of ``value`` and ``array[index]`` and atomically update the array. Note that for vectors and matrices the operation is only atomic on a per-component basis.
+    """
+    ...
+
+
+@over
+def atomic_max(a: FabricArray[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
+    """
+    Compute the maximum of ``value`` and ``array[index]`` and atomically update the array. Note that for vectors and matrices the operation is only atomic on a per-component basis.
+    """
+    ...
+
+
+@over
+def atomic_max(a: IndexedFabricArray[Any], i: int32, value: Any):
+    """
+    Compute the maximum of ``value`` and ``array[index]`` and atomically update the array. Note that for vectors and matrices the operation is only atomic on a per-component basis.
+    """
+    ...
+
+
+@over
+def atomic_max(a: IndexedFabricArray[Any], i: int32, j: int32, value: Any):
+    """
+    Compute the maximum of ``value`` and ``array[index]`` and atomically update the array. Note that for vectors and matrices the operation is only atomic on a per-component basis.
+    """
+    ...
+
+
+@over
+def atomic_max(a: IndexedFabricArray[Any], i: int32, j: int32, k: int32, value: Any):
+    """
+    Compute the maximum of ``value`` and ``array[index]`` and atomically update the array. Note that for vectors and matrices the operation is only atomic on a per-component basis.
+    """
+    ...
+
+
+@over
+def atomic_max(a: IndexedFabricArray[Any], i: int32, j: int32, k: int32, l: int32, value: Any):
     """
     Compute the maximum of ``value`` and ``array[index]`` and atomically update the array. Note that for vectors and matrices the operation is only atomic on a per-component basis.
     """
@@ -1694,6 +2066,14 @@ def expect_near(arg1: vec3f, arg2: vec3f, tolerance: float32):
 def lower_bound(arr: Array[Scalar], value: Scalar) -> int:
     """
     Search a sorted array for the closest element greater than or equal to value.
+    """
+    ...
+
+
+@over
+def lower_bound(arr: Array[Scalar], arr_begin: int32, arr_end: int32, value: Scalar) -> int:
+    """
+    Search a sorted array range [arr_begin, arr_end) for the closest element greater than or equal to value.
     """
     ...
 
@@ -1952,6 +2332,12 @@ def neg(x: Quaternion[Scalar]) -> Quaternion[Scalar]:
 
 @over
 def neg(x: Matrix[Any, Any, Scalar]) -> Matrix[Any, Any, Scalar]:
+    """ """
+    ...
+
+
+@over
+def unot(b: bool) -> bool:
     """ """
     ...
 

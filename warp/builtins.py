@@ -5,15 +5,12 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-from .context import add_builtin
+import builtins
+from typing import Any, Callable, Dict, List, Tuple
 
 from warp.types import *
 
-from typing import Tuple
-from typing import List
-from typing import Dict
-from typing import Any
-from typing import Callable
+from .context import add_builtin
 
 
 def sametype_value_func(default):
@@ -542,6 +539,26 @@ add_builtin(
     doc="Returns a matrix with the components of the vector d on the diagonal",
 )
 
+
+def value_func_get_diag(args, kwds, _):
+    if args is None:
+        return vector(length=(Any), dtype=Scalar)
+    else:
+        if args[0].type._shape_[0] != args[0].type._shape_[1]:
+            raise RuntimeError(
+                f"Matrix shape is {args[0].type._shape_}; get_diag is only available for square matrices."
+            )
+        return vector(length=args[0].type._shape_[0], dtype=args[0].type._wp_scalar_type_)
+
+
+add_builtin(
+    "get_diag",
+    input_types={"m": matrix(shape=(Any, Any), dtype=Scalar)},
+    value_func=value_func_get_diag,
+    group="Vector Math",
+    doc="Returns a vector containing the diagonal elements of the square matrix.",
+)
+
 add_builtin(
     "cw_mul",
     input_types={"x": vector(length=Any, dtype=Scalar), "y": vector(length=Any, dtype=Scalar)},
@@ -581,6 +598,9 @@ for t in scalar_types_all:
             t.__name__, input_types={"u": u}, value_type=t, doc="", hidden=True, group="Scalar Math", export=False
         )
 
+for u in [bool, builtins.bool]:
+    add_builtin(bool.__name__, input_types={"u": u}, value_type=bool, doc="", hidden=True, export=False, namespace="")
+
 
 def vector_constructor_func(args, kwds, templates):
     if args is None:
@@ -604,6 +624,13 @@ def vector_constructor_func(args, kwds, templates):
                 # value initialization e.g.: wp.vec(1.0, length=5)
                 veclen = kwds["length"]
                 vectype = args[0].type
+                if getattr(vectype, "_wp_generic_type_str_", None) == "vec_t":
+                    # constructor from another matrix
+                    if vectype._length_ != veclen:
+                        raise RuntimeError(
+                            f"Incompatible vector lengths for casting copy constructor, {veclen} vs {vectype._length_}"
+                        )
+                    vectype = vectype._wp_scalar_type_
             else:
                 raise RuntimeError(
                     "vec() must have one scalar argument or the dtype keyword argument if the length keyword argument is specified, e.g.: wp.vec(1.0, length=5)"
@@ -625,7 +652,11 @@ def vector_constructor_func(args, kwds, templates):
             veclen = len(args)
             vectype = args[0].type
 
-            if not all(vectype == a.type for a in args):
+            if len(args) == 1 and getattr(vectype, "_wp_generic_type_str_", None) == "vec_t":
+                # constructor from another vector
+                veclen = vectype._length_
+                vectype = vectype._wp_scalar_type_
+            elif not all(vectype == a.type for a in args):
                 raise RuntimeError(
                     f"All numeric arguments to vec() constructor should have the same type, expected {veclen} args of type {vectype}, received { ','.join(map(lambda x : str(x.type), args)) }"
                 )
@@ -637,7 +668,13 @@ def vector_constructor_func(args, kwds, templates):
     else:
         # construction of a predeclared type, e.g.: vec5d
         veclen, vectype = templates
-        if not all(vectype == a.type for a in args):
+        if len(args) == 1 and getattr(args[0].type, "_wp_generic_type_str_", None) == "vec_t":
+            # constructor from another vector
+            if args[0].type._length_ != veclen:
+                raise RuntimeError(
+                    f"Incompatible matrix sizes for casting copy constructor, {veclen} vs {args[0].type._length_}"
+                )
+        elif not all(vectype == a.type for a in args):
             raise RuntimeError(
                 f"All numeric arguments to vec() constructor should have the same type, expected {veclen} args of type {vectype}, received { ','.join(map(lambda x : str(x.type), args)) }"
             )
@@ -681,7 +718,14 @@ def matrix_constructor_func(args, kwds, templates):
             shape = kwds["shape"]
             dtype = args[0].type
 
-            if len(args) > 1 and len(args) != shape[0] * shape[1]:
+            if len(args) == 1 and getattr(dtype, "_wp_generic_type_str_", None) == "mat_t":
+                # constructor from another matrix
+                if types[0]._shape_ != shape:
+                    raise RuntimeError(
+                        f"Incompatible matrix sizes for casting copy constructor, {shape} vs {types[0]._shape_}"
+                    )
+                dtype = dtype._wp_scalar_type_
+            elif len(args) > 1 and len(args) != shape[0] * shape[1]:
                 raise RuntimeError(
                     "Wrong number of arguments for matrix() function, must initialize with either a scalar value, or m*n values"
                 )
@@ -696,31 +740,37 @@ def matrix_constructor_func(args, kwds, templates):
         dtype = templates[2]
 
         if len(args) > 0:
-            # check scalar arg type matches declared type
-            if infer_scalar_type(args) != dtype:
-                raise RuntimeError("Wrong scalar type for mat {} constructor".format(",".join(map(str, templates))))
-
-            # check vector arg type matches declared type
             types = [a.type for a in args]
-            if all(hasattr(a, "_wp_generic_type_str_") and a._wp_generic_type_str_ == "vec_t" for a in types):
-                cols = len(types)
-                if shape[1] != cols:
+            if len(args) == 1 and getattr(types[0], "_wp_generic_type_str_", None) == "mat_t":
+                # constructor from another matrix with same dimension but possibly different type
+                if types[0]._shape_ != shape:
                     raise RuntimeError(
-                        "Wrong number of vectors when attempting to construct a matrix with column vectors"
+                        f"Incompatible matrix sizes for casting copy constructor, {shape} vs {types[0]._shape_}"
                     )
-
-                if not all(a._length_ == shape[0] for a in types):
-                    raise RuntimeError(
-                        "Wrong vector row count when attempting to construct a matrix with column vectors"
-                    )
-
             else:
-                # check that we either got 1 arg (scalar construction), or enough values for whole matrix
-                size = shape[0] * shape[1]
-                if len(args) > 1 and len(args) != size:
-                    raise RuntimeError(
-                        "Wrong number of scalars when attempting to construct a matrix from a list of components"
-                    )
+                # check scalar arg type matches declared type
+                if infer_scalar_type(args) != dtype:
+                    raise RuntimeError("Wrong scalar type for mat {} constructor".format(",".join(map(str, templates))))
+
+                # check vector arg type matches declared type
+                if all(hasattr(a, "_wp_generic_type_str_") and a._wp_generic_type_str_ == "vec_t" for a in types):
+                    cols = len(types)
+                    if shape[1] != cols:
+                        raise RuntimeError(
+                            "Wrong number of vectors when attempting to construct a matrix with column vectors"
+                        )
+
+                    if not all(a._length_ == shape[0] for a in types):
+                        raise RuntimeError(
+                            "Wrong vector row count when attempting to construct a matrix with column vectors"
+                        )
+                else:
+                    # check that we either got 1 arg (scalar construction), or enough values for whole matrix
+                    size = shape[0] * shape[1]
+                    if len(args) > 1 and len(args) != size:
+                        raise RuntimeError(
+                            "Wrong number of scalars when attempting to construct a matrix from a list of components"
+                        )
 
     return matrix(shape=shape, dtype=dtype)
 
@@ -1395,7 +1445,7 @@ add_builtin(
 add_builtin(
     "bvh_query_next",
     input_types={"query": bvh_query_t, "index": int},
-    value_type=bool,
+    value_type=builtins.bool,
     group="Geometry",
     doc="""Move to the next bound returned by the query. The index of the current bound is stored in ``index``, returns ``False``
    if there are no more overlapping bound.""",
@@ -1412,9 +1462,12 @@ add_builtin(
         "bary_u": float,
         "bary_v": float,
     },
-    value_type=bool,
+    value_type=builtins.bool,
     group="Geometry",
     doc="""Computes the closest point on the mesh with identifier `id` to the given point in space. Returns ``True`` if a point < ``max_dist`` is found.
+
+   Identifies the sign of the distance using additional ray-casts to determine if the point is inside or outside. This method is relatively robust, but
+   does increase computational cost. See below for additional sign determination methods.
 
    :param id: The mesh identifier
    :param point: The point in space to query
@@ -1423,6 +1476,95 @@ add_builtin(
    :param face: Returns the index of the closest face
    :param bary_u: Returns the barycentric u coordinate of the closest point
    :param bary_v: Returns the barycentric v coordinate of the closest point""",
+)
+
+add_builtin(
+    "mesh_query_point_no_sign",
+    input_types={
+        "id": uint64,
+        "point": vec3,
+        "max_dist": float,
+        "face": int,
+        "bary_u": float,
+        "bary_v": float,
+    },
+    value_type=builtins.bool,
+    group="Geometry",
+    doc="""Computes the closest point on the mesh with identifier `id` to the given point in space. Returns ``True`` if a point < ``max_dist`` is found.
+
+   This method does not compute the sign of the point (inside/outside) which makes it faster than other point query methods.
+
+   :param id: The mesh identifier
+   :param point: The point in space to query
+   :param max_dist: Mesh faces above this distance will not be considered by the query
+   :param face: Returns the index of the closest face
+   :param bary_u: Returns the barycentric u coordinate of the closest point
+   :param bary_v: Returns the barycentric v coordinate of the closest point""",
+)
+
+add_builtin(
+    "mesh_query_point_sign_normal",
+    input_types={
+        "id": uint64,
+        "point": vec3,
+        "max_dist": float,
+        "inside": float,
+        "face": int,
+        "bary_u": float,
+        "bary_v": float,
+        "epsilon": float,
+    },
+    defaults={"epsilon": 1.0e-3},
+    value_type=builtins.bool,
+    group="Geometry",
+    doc="""Computes the closest point on the mesh with identifier `id` to the given point in space. Returns ``True`` if a point < ``max_dist`` is found.
+    
+   Identifies the sign of the distance (inside/outside) using the angle-weighted pseudo normal. This approach to sign determination is robust for well conditioned meshes
+   that are watertight and non-self intersecting, it is also comparatively fast to compute.
+
+   :param id: The mesh identifier
+   :param point: The point in space to query
+   :param max_dist: Mesh faces above this distance will not be considered by the query
+   :param inside: Returns a value < 0 if query point is inside the mesh, >=0 otherwise. Note that mesh must be watertight for this to be robust
+   :param face: Returns the index of the closest face
+   :param bary_u: Returns the barycentric u coordinate of the closest point
+   :param bary_v: Returns the barycentric v coordinate of the closest point
+   :param epsilon: Epsilon treating distance values as equal, when locating the minimum distance vertex/face/edge, as a fraction of the average edge length, also for treating closest point as being on edge/vertex default 1e-3""",
+)
+
+add_builtin(
+    "mesh_query_point_sign_winding_number",
+    input_types={
+        "id": uint64,
+        "point": vec3,
+        "max_dist": float,
+        "inside": float,
+        "face": int,
+        "bary_u": float,
+        "bary_v": float,
+        "accuracy": float,
+        "threshold": float,
+    },
+    defaults={"accuracy": 2.0, "threshold": 0.5},
+    value_type=builtins.bool,
+    group="Geometry",
+    doc="""Computes the closest point on the mesh with identifier `id` to the given point in space. Returns ``True`` if a point < ``max_dist`` is found. 
+    
+   Identifies the sign using the winding number of the mesh relative to the query point. This method of sign determination is robust for poorly conditioned meshes
+   and provides a smooth approximation to sign even when the mesh is not watertight. This method is the most robust and accurate of the sign determination meshes
+   but also the most expensive.
+     
+    Note that the Mesh object must be constructed with ``suport_winding_number=True`` for this method to return correct results.
+
+   :param id: The mesh identifier
+   :param point: The point in space to query
+   :param max_dist: Mesh faces above this distance will not be considered by the query
+   :param inside: Returns a value < 0 if query point is inside the mesh, >=0 otherwise. Note that mesh must be watertight for this to be robust
+   :param face: Returns the index of the closest face
+   :param bary_u: Returns the barycentric u coordinate of the closest point
+   :param bary_v: Returns the barycentric v coordinate of the closest point
+   :param accuracy: Accuracy for computing the winding number with fast winding number method utilizing second order dipole approximation, default 2.0
+   :param threshold: The threshold of the winding number to be considered inside, default 0.5""",
 )
 
 add_builtin(
@@ -1439,7 +1581,7 @@ add_builtin(
         "normal": vec3,
         "face": int,
     },
-    value_type=bool,
+    value_type=builtins.bool,
     group="Geometry",
     doc="""Computes the closest ray hit on the mesh with identifier `id`, returns ``True`` if a point < ``max_t`` is found.
 
@@ -1471,7 +1613,7 @@ add_builtin(
 add_builtin(
     "mesh_query_aabb_next",
     input_types={"query": mesh_query_aabb_t, "index": int},
-    value_type=bool,
+    value_type=builtins.bool,
     group="Geometry",
     doc="""Move to the next triangle overlapping the query bounding box. The index of the current face is stored in ``index``, returns ``False``
    if there are no more overlapping triangles.""",
@@ -1505,7 +1647,7 @@ add_builtin(
 add_builtin(
     "hash_grid_query_next",
     input_types={"query": hash_grid_query_t, "index": int},
-    value_type=bool,
+    value_type=builtins.bool,
     group="Geometry",
     doc="""Move to the next point in the hash grid query. The index of the current neighbor is stored in ``index``, returns ``False``
    if there are no more neighbors.""",
@@ -1617,6 +1759,14 @@ add_builtin(
     value_type=float,
     group="Volumes",
     doc="""Sample the volume given by ``id`` at the volume local-space point ``uvw``. Interpolation should be ``wp.Volume.CLOSEST``, or ``wp.Volume.LINEAR.``""",
+)
+
+add_builtin(
+    "volume_sample_grad_f",
+    input_types={"id": uint64, "uvw": vec3, "sampling_mode": int, "grad": vec3},
+    value_type=float,
+    group="Volumes",
+    doc="""Sample the volume and its gradient given by ``id`` at the volume local-space point ``uvw``. Interpolation should be ``wp.Volume.CLOSEST``, or ``wp.Volume.LINEAR.``""",
 )
 
 add_builtin(
@@ -1993,6 +2143,13 @@ add_builtin(
     doc="Select between two arguments, if cond is false then return ``arg1``, otherwise return ``arg2``",
     group="Utility",
 )
+add_builtin(
+    "select",
+    input_types={"cond": builtins.bool, "arg1": Any, "arg2": Any},
+    value_func=lambda args, kwds, _: args[1].type,
+    doc="Select between two arguments, if cond is false then return ``arg1``, otherwise return ``arg2``",
+    group="Utility",
+)
 for t in int_types:
     add_builtin(
         "select",
@@ -2056,13 +2213,13 @@ def view_value_func(args, kwds, _):
             raise RuntimeError(f"view() index arguments must be of integer type, got index of type {a.type}")
 
     # create an array view with leading dimensions removed
-    import copy
-
-    view_type = copy.copy(args[0].type)
-    view_type.ndim -= num_indices
-
-    return view_type
-
+    dtype = args[0].type.dtype
+    ndim = num_dims - num_indices
+    if isinstance(args[0].type, (fabricarray, indexedfabricarray)):
+        # fabric array of arrays: return array attribute as a regular array
+        return array(dtype=dtype, ndim=ndim)
+    else:
+        return type(args[0].type)(dtype=dtype, ndim=ndim)
 
 # does argument checking and type propagation for store()
 def store_value_func(args, kwds, _):
@@ -2560,6 +2717,12 @@ add_builtin(
     doc="Project a real symmetric matrix of at most 9x9 size to be positive semi-definite. The matrix is stored in mat33 blocks."
 )
 
+add_builtin(
+    "lower_bound",
+    input_types={"arr": array(dtype=Scalar), "arr_begin": int, "arr_end": int, "value": Scalar},
+    value_type=int,
+    doc="Search a sorted array range [arr_begin, arr_end) for the closest element greater than or equal to value.",
+)
 
 # ---------------------------------
 # Operators
@@ -2853,9 +3016,10 @@ add_builtin(
     group="Operators",
 )
 
-add_builtin("unot", input_types={"b": bool}, value_type=bool, doc="", group="Operators")
+add_builtin("unot", input_types={"b": builtins.bool}, value_type=builtins.bool, doc="", group="Operators")
+add_builtin("unot", input_types={"b": bool}, value_type=builtins.bool, doc="", group="Operators")
 for t in int_types:
-    add_builtin("unot", input_types={"b": t}, value_type=bool, doc="", group="Operators")
+    add_builtin("unot", input_types={"b": t}, value_type=builtins.bool, doc="", group="Operators")
 
 
-add_builtin("unot", input_types={"a": array(dtype=Any)}, value_type=bool, doc="", group="Operators")
+add_builtin("unot", input_types={"a": array(dtype=Any)}, value_type=builtins.bool, doc="", group="Operators")

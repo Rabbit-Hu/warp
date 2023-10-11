@@ -10,33 +10,99 @@
 #include "scan.h"
 #include "array.h"
 
+#include "exports.h"
+
 #include "stdlib.h"
 #include "string.h"
-
-
-namespace wp
-{
-
-extern "C"
-{
-    #include "exports.h"
-}
-
-} // namespace wp
 
 int cuda_init();
 
 
 uint16_t float_to_half_bits(float x)
 {
-    return wp::half(x).u;
+    // adapted from Fabien Giesen's post: https://gist.github.com/rygorous/2156668
+    union fp32
+    {
+        uint32_t u;
+        float f;
+
+        struct
+        {
+            unsigned int mantissa : 23;
+            unsigned int exponent : 8;
+            unsigned int sign : 1;
+        };
+    };
+
+    fp32 f;
+    f.f = x;
+
+    fp32 f32infty = { 255 << 23 };
+    fp32 f16infty = { 31 << 23 };
+    fp32 magic = { 15 << 23 };
+    uint32_t sign_mask = 0x80000000u;
+    uint32_t round_mask = ~0xfffu; 
+    uint16_t u;
+
+    uint32_t sign = f.u & sign_mask;
+    f.u ^= sign;
+
+    // NOTE all the integer compares in this function can be safely
+    // compiled into signed compares since all operands are below
+    // 0x80000000. Important if you want fast straight SSE2 code
+    // (since there's no unsigned PCMPGTD).
+
+    if (f.u >= f32infty.u) // Inf or NaN (all exponent bits set)
+        u = (f.u > f32infty.u) ? 0x7e00 : 0x7c00; // NaN->qNaN and Inf->Inf
+    else // (De)normalized number or zero
+    {
+        f.u &= round_mask;
+        f.f *= magic.f;
+        f.u -= round_mask;
+        if (f.u > f16infty.u) f.u = f16infty.u; // Clamp to signed infinity if overflowed
+
+        u = f.u >> 13; // Take the bits!
+    }
+
+    u |= sign >> 16;
+    return u;
 }
 
 float half_bits_to_float(uint16_t u)
 {
-    wp::half h;
-    h.u = u;
-    return half_to_float(h);
+    // adapted from Fabien Giesen's post: https://gist.github.com/rygorous/2156668
+    union fp32
+    {
+        uint32_t u;
+        float f;
+
+        struct
+        {
+            unsigned int mantissa : 23;
+            unsigned int exponent : 8;
+            unsigned int sign : 1;
+        };
+    };
+
+    static const fp32 magic = { 113 << 23 };
+    static const uint32_t shifted_exp = 0x7c00 << 13; // exponent mask after shift
+    fp32 o;
+
+    o.u = (u & 0x7fff) << 13;     // exponent/mantissa bits
+    uint32_t exp = shifted_exp & o.u;   // just the exponent
+    o.u += (127 - 15) << 23;        // exponent adjust
+
+    // handle exponent special cases
+    if (exp == shifted_exp) // Inf/NaN?
+        o.u += (128 - 16) << 23;    // extra exp adjust
+    else if (exp == 0) // Zero/Denormal?
+    {
+        o.u += 1 << 23;             // extra exp adjust
+        o.f -= magic.f;             // renormalize
+    }
+
+    o.u |= (u & 0x8000) << 16;    // sign bit
+    return o.f;
 }
 
 int init()
@@ -102,34 +168,38 @@ void memset_host(void* dest, int value, size_t n)
     }
 }
 
-void memtile_host(void* dest, void *src, size_t srcsize, size_t n)
+// fill memory buffer with a value: this is a faster memtile variant
+// for types bigger than one byte, but requires proper alignment of dst
+template <typename T>
+void memtile_value_host(T* dst, T value, size_t n)
 {
-    for( size_t i=0; i < n; ++i )
+    while (n--)
+        *dst++ = value;
+}
+
+void memtile_host(void* dst, const void* src, size_t srcsize, size_t n)
+{
+    size_t dst_addr = reinterpret_cast<size_t>(dst);
+    size_t src_addr = reinterpret_cast<size_t>(src);
+
+    // try memtile_value first because it should be faster, but we need to ensure proper alignment
+    if (srcsize == 8 && (dst_addr & 7) == 0 && (src_addr & 7) == 0)
+        memtile_value_host(reinterpret_cast<int64_t*>(dst), *reinterpret_cast<const int64_t*>(src), n);
+    else if (srcsize == 4 && (dst_addr & 3) == 0 && (src_addr & 3) == 0)
+        memtile_value_host(reinterpret_cast<int32_t*>(dst), *reinterpret_cast<const int32_t*>(src), n);
+    else if (srcsize == 2 && (dst_addr & 1) == 0 && (src_addr & 1) == 0)
+        memtile_value_host(reinterpret_cast<int16_t*>(dst), *reinterpret_cast<const int16_t*>(src), n);
+    else if (srcsize == 1)
+        memset(dst, *reinterpret_cast<const int8_t*>(src), n);
+    else
     {
-        memcpy(dest,src,srcsize);
-        dest = (char*)dest + srcsize;
+        // generic version
+        while (n--)
+        {
+            memcpy(dst, src, srcsize);
+            dst = (int8_t*)dst + srcsize;
+        }
     }
-}
-
-void array_inner_host(uint64_t a, uint64_t b, uint64_t out, int len)
-{
-    const float* ptr_a = (const float*)(a);
-    const float* ptr_b = (const float*)(b);
-    float* ptr_out = (float*)(out);
-
-    *ptr_out = 0.0f;
-    for (int i=0; i < len; ++i)
-        *ptr_out += ptr_a[i]*ptr_b[i];
-}
-
-void array_sum_host(uint64_t a, uint64_t out, int len)
-{
-    const float* ptr_a = (const float*)(a);
-    float* ptr_out = (float*)(out);
-
-    *ptr_out = 0.0f;
-    for (int i=0; i < len; ++i)
-        *ptr_out += ptr_a[i];
 }
 
 void array_scan_int_host(uint64_t in, uint64_t out, int len, bool inclusive)
@@ -175,6 +245,312 @@ static void array_copy_nd(void* dst, const void* src,
 }
 
 
+static void array_copy_to_fabric(wp::fabricarray_t<void>& dst, const void* src_data,
+                                 int src_stride, const int* src_indices, int elem_size)
+{
+    const int8_t* src_ptr = static_cast<const int8_t*>(src_data);
+
+    if (src_indices)
+    {
+        // copy from indexed array
+        for (size_t i = 0; i < dst.nbuckets; i++)
+        {
+            const wp::fabricbucket_t& bucket = dst.buckets[i];
+            int8_t* dst_ptr = static_cast<int8_t*>(bucket.ptr);
+            size_t bucket_size = bucket.index_end - bucket.index_start;
+            for (size_t j = 0; j < bucket_size; j++)
+            {
+                int idx = *src_indices;
+                memcpy(dst_ptr, src_ptr + idx * elem_size, elem_size);
+                dst_ptr += elem_size;
+                ++src_indices;
+            }
+        }
+    }
+    else
+    {
+        if (src_stride == elem_size)
+        {
+            // copy from contiguous array
+            for (size_t i = 0; i < dst.nbuckets; i++)
+            {
+                const wp::fabricbucket_t& bucket = dst.buckets[i];
+                size_t num_bytes = (bucket.index_end - bucket.index_start) * elem_size;
+                memcpy(bucket.ptr, src_ptr, num_bytes);
+                src_ptr += num_bytes;
+            }
+        }
+        else
+        {
+            // copy from strided array
+            for (size_t i = 0; i < dst.nbuckets; i++)
+            {
+                const wp::fabricbucket_t& bucket = dst.buckets[i];
+                int8_t* dst_ptr = static_cast<int8_t*>(bucket.ptr);
+                size_t bucket_size = bucket.index_end - bucket.index_start;
+                for (size_t j = 0; j < bucket_size; j++)
+                {
+                    memcpy(dst_ptr, src_ptr, elem_size);
+                    src_ptr += src_stride;
+                    dst_ptr += elem_size;
+                }
+            }
+        }
+    }
+}
+
+static void array_copy_from_fabric(const wp::fabricarray_t<void>& src, void* dst_data,
+                                   int dst_stride, const int* dst_indices, int elem_size)
+{
+    int8_t* dst_ptr = static_cast<int8_t*>(dst_data);
+
+    if (dst_indices)
+    {
+        // copy to indexed array
+        for (size_t i = 0; i < src.nbuckets; i++)
+        {
+            const wp::fabricbucket_t& bucket = src.buckets[i];
+            const int8_t* src_ptr = static_cast<const int8_t*>(bucket.ptr);
+            size_t bucket_size = bucket.index_end - bucket.index_start;
+            for (size_t j = 0; j < bucket_size; j++)
+            {
+                int idx = *dst_indices;
+                memcpy(dst_ptr + idx * elem_size, src_ptr, elem_size);
+                src_ptr += elem_size;
+                ++dst_indices;
+            }
+        }
+    }
+    else
+    {
+        if (dst_stride == elem_size)
+        {
+            // copy to contiguous array
+            for (size_t i = 0; i < src.nbuckets; i++)
+            {
+                const wp::fabricbucket_t& bucket = src.buckets[i];
+                size_t num_bytes = (bucket.index_end - bucket.index_start) * elem_size;
+                memcpy(dst_ptr, bucket.ptr, num_bytes);
+                dst_ptr += num_bytes;
+            }
+        }
+        else
+        {
+            // copy to strided array
+            for (size_t i = 0; i < src.nbuckets; i++)
+            {
+                const wp::fabricbucket_t& bucket = src.buckets[i];
+                const int8_t* src_ptr = static_cast<const int8_t*>(bucket.ptr);
+                size_t bucket_size = bucket.index_end - bucket.index_start;
+                for (size_t j = 0; j < bucket_size; j++)
+                {
+                    memcpy(dst_ptr, src_ptr, elem_size);
+                    dst_ptr += dst_stride;
+                    src_ptr += elem_size;
+                }
+            }
+        }
+    }
+}
+
+static void array_copy_fabric_to_fabric(wp::fabricarray_t<void>& dst, const wp::fabricarray_t<void>& src, int elem_size)
+{
+    wp::fabricbucket_t* dst_bucket = dst.buckets;
+    const wp::fabricbucket_t* src_bucket = src.buckets;
+    int8_t* dst_ptr = static_cast<int8_t*>(dst_bucket->ptr);
+    const int8_t* src_ptr = static_cast<const int8_t*>(src_bucket->ptr);
+    size_t dst_remaining = dst_bucket->index_end - dst_bucket->index_start;
+    size_t src_remaining = src_bucket->index_end - src_bucket->index_start;
+    size_t total_copied = 0;
+
+    while (total_copied < dst.size)
+    {
+        if (dst_remaining <= src_remaining)
+        {
+            // copy to destination bucket
+            size_t num_elems = dst_remaining;
+            size_t num_bytes = num_elems * elem_size;
+            memcpy(dst_ptr, src_ptr, num_bytes);
+
+            // advance to next destination bucket
+            ++dst_bucket;
+            dst_ptr = static_cast<int8_t*>(dst_bucket->ptr);
+            dst_remaining = dst_bucket->index_end - dst_bucket->index_start;
+
+            // advance source offset
+            src_ptr += num_bytes;
+            src_remaining -= num_elems;
+
+            total_copied += num_elems;
+        }
+        else
+        {
+            // copy to destination bucket
+            size_t num_elems = src_remaining;
+            size_t num_bytes = num_elems * elem_size;
+            memcpy(dst_ptr, src_ptr, num_bytes);
+
+            // advance to next source bucket
+            ++src_bucket;
+            src_ptr = static_cast<const int8_t*>(src_bucket->ptr);
+            src_remaining = src_bucket->index_end - src_bucket->index_start;
+
+            // advance destination offset
+            dst_ptr += num_bytes;
+            dst_remaining -= num_elems;
+
+            total_copied += num_elems;
+        }
+    }
+}
+
+
+static void array_copy_to_fabric_indexed(wp::indexedfabricarray_t<void>& dst, const void* src_data,
+                                         int src_stride, const int* src_indices, int elem_size)
+{
+    const int8_t* src_ptr = static_cast<const int8_t*>(src_data);
+
+    if (src_indices)
+    {
+        // copy from indexed array
+        for (size_t i = 0; i < dst.size; i++)
+        {
+            size_t src_idx = src_indices[i];
+            size_t dst_idx = dst.indices[i];
+            void* dst_ptr = fabricarray_element_ptr(dst.fa, dst_idx, elem_size);
+            memcpy(dst_ptr, src_ptr + dst_idx * elem_size, elem_size);
+        }
+    }
+    else
+    {
+        // copy from contiguous/strided array
+        for (size_t i = 0; i < dst.size; i++)
+        {
+            size_t dst_idx = dst.indices[i];
+            void* dst_ptr = fabricarray_element_ptr(dst.fa, dst_idx, elem_size);
+            if (dst_ptr)
+            {
+                memcpy(dst_ptr, src_ptr, elem_size);
+                src_ptr += src_stride;
+            }
+        }
+    }
+}
+
+
+static void array_copy_fabric_indexed_to_fabric(wp::fabricarray_t<void>& dst, const wp::indexedfabricarray_t<void>& src, int elem_size)
+{
+    wp::fabricbucket_t* dst_bucket = dst.buckets;
+    int8_t* dst_ptr = static_cast<int8_t*>(dst_bucket->ptr);
+    int8_t* dst_end = dst_ptr + elem_size * (dst_bucket->index_end - dst_bucket->index_start);
+
+    for (size_t i = 0; i < src.size; i++)
+    {
+        size_t src_idx = src.indices[i];
+        const void* src_ptr = fabricarray_element_ptr(src.fa, src_idx, elem_size);
+
+        if (dst_ptr >= dst_end)
+        {
+            // advance to next destination bucket
+            ++dst_bucket;
+            dst_ptr = static_cast<int8_t*>(dst_bucket->ptr);
+            dst_end = dst_ptr + elem_size * (dst_bucket->index_end - dst_bucket->index_start);
+        }
+
+        memcpy(dst_ptr, src_ptr, elem_size);
+
+        dst_ptr += elem_size;
+    }
+}
+
+
+static void array_copy_fabric_indexed_to_fabric_indexed(wp::indexedfabricarray_t<void>& dst, const wp::indexedfabricarray_t<void>& src, int elem_size)
+{
+    for (size_t i = 0; i < src.size; i++)
+    {
+        size_t src_idx = src.indices[i];
+        size_t dst_idx = dst.indices[i];
+
+        const void* src_ptr = fabricarray_element_ptr(src.fa, src_idx, elem_size);
+        void* dst_ptr = fabricarray_element_ptr(dst.fa, dst_idx, elem_size);
+
+        memcpy(dst_ptr, src_ptr, elem_size);
+    }
+}
+
+
+static void array_copy_fabric_to_fabric_indexed(wp::indexedfabricarray_t<void>& dst, const wp::fabricarray_t<void>& src, int elem_size)
+{
+    wp::fabricbucket_t* src_bucket = src.buckets;
+    const int8_t* src_ptr = static_cast<const int8_t*>(src_bucket->ptr);
+    const int8_t* src_end = src_ptr + elem_size * (src_bucket->index_end - src_bucket->index_start);
+
+    for (size_t i = 0; i < dst.size; i++)
+    {
+        size_t dst_idx = dst.indices[i];
+        void* dst_ptr = fabricarray_element_ptr(dst.fa, dst_idx, elem_size);
+
+        if (src_ptr >= src_end)
+        {
+            // advance to next source bucket
+            ++src_bucket;
+            src_ptr = static_cast<int8_t*>(src_bucket->ptr);
+            src_end = src_ptr + elem_size * (src_bucket->index_end - src_bucket->index_start);
+        }
+
+        memcpy(dst_ptr, src_ptr, elem_size);
+
+        src_ptr += elem_size;
+    }
+}
+
+
+static void array_copy_from_fabric_indexed(const wp::indexedfabricarray_t<void>& src, void* dst_data,
+                                           int dst_stride, const int* dst_indices, int elem_size)
+{
+    int8_t* dst_ptr = static_cast<int8_t*>(dst_data);
+
+    if (dst_indices)
+    {
+        // copy to indexed array
+        for (size_t i = 0; i < src.size; i++)
+        {
+            size_t idx = src.indices[i];
+            if (idx < src.fa.size)
+            {
+                const void* src_ptr = fabricarray_element_ptr(src.fa, idx, elem_size);
+                int dst_idx = dst_indices[i];
+                memcpy(dst_ptr + dst_idx * elem_size, src_ptr, elem_size);
+            }
+            else
+            {
+                fprintf(stderr, "Warp copy error: Source index %llu is out of bounds for fabric array of size %llu",
+                        (unsigned long long)idx, (unsigned long long)src.fa.size);
+            }
+        }
+    }
+    else
+    {
+        // copy to contiguous/strided array
+        for (size_t i = 0; i < src.size; i++)
+        {
+            size_t idx = src.indices[i];
+            if (idx < src.fa.size)
+            {
+                const void* src_ptr = fabricarray_element_ptr(src.fa, idx, elem_size);
+                memcpy(dst_ptr, src_ptr, elem_size);
+                dst_ptr += dst_stride;
+            }
+            else
+            {
+                fprintf(stderr, "Warp copy error: Source index %llu is out of bounds for fabric array of size %llu",
+                        (unsigned long long)idx, (unsigned long long)src.fa.size);
+            }
+        }
+    }
+}
+
+
 WP_API size_t array_copy_host(void* dst, void* src, int dst_type, int src_type, int elem_size)
 {
     if (!src || !dst)
@@ -192,6 +568,12 @@ WP_API size_t array_copy_host(void* dst, void* src, int dst_type, int src_type, 
     const int* dst_strides = NULL;
     const int*const* src_indices = NULL;
     const int*const* dst_indices = NULL;
+
+    const wp::fabricarray_t<void>* src_fabricarray = NULL;
+    wp::fabricarray_t<void>* dst_fabricarray = NULL;
+
+    const wp::indexedfabricarray_t<void>* src_indexedfabricarray = NULL;
+    wp::indexedfabricarray_t<void>* dst_indexedfabricarray = NULL;
 
     const int* null_indices[wp::ARRAY_MAX_DIMS] = { NULL };
 
@@ -214,9 +596,19 @@ WP_API size_t array_copy_host(void* dst, void* src, int dst_type, int src_type, 
         src_strides = src_arr.arr.strides;
         src_indices = src_arr.indices;
     }
+    else if (src_type == wp::ARRAY_TYPE_FABRIC)
+    {
+        src_fabricarray = static_cast<const wp::fabricarray_t<void>*>(src);
+        src_ndim = 1;
+    }
+    else if (src_type == wp::ARRAY_TYPE_FABRIC_INDEXED)
+    {
+        src_indexedfabricarray = static_cast<const wp::indexedfabricarray_t<void>*>(src);
+        src_ndim = 1;
+    }
     else
     {
-        fprintf(stderr, "Warp error: Invalid array type (%d)\n", src_type);
+        fprintf(stderr, "Warp copy error: Invalid source array type (%d)\n", src_type);
         return 0;
     }
 
@@ -239,26 +631,134 @@ WP_API size_t array_copy_host(void* dst, void* src, int dst_type, int src_type, 
         dst_strides = dst_arr.arr.strides;
         dst_indices = dst_arr.indices;
     }
+    else if (dst_type == wp::ARRAY_TYPE_FABRIC)
+    {
+        dst_fabricarray = static_cast<wp::fabricarray_t<void>*>(dst);
+        dst_ndim = 1;
+    }
+    else if (dst_type == wp::ARRAY_TYPE_FABRIC_INDEXED)
+    {
+        dst_indexedfabricarray = static_cast<wp::indexedfabricarray_t<void>*>(dst);
+        dst_ndim = 1;
+    }
     else
     {
-        fprintf(stderr, "Warp error: Invalid array type (%d)\n", dst_type);
+        fprintf(stderr, "Warp copy error: Invalid destination array type (%d)\n", dst_type);
         return 0;
     }
 
     if (src_ndim != dst_ndim)
     {
-        fprintf(stderr, "Warp error: Incompatible array dimensionalities (%d and %d)\n", src_ndim, dst_ndim);
+        fprintf(stderr, "Warp copy error: Incompatible array dimensionalities (%d and %d)\n", src_ndim, dst_ndim);
         return 0;
     }
 
-    bool has_grad = (src_grad && dst_grad);
-    size_t n = 1;
+    // handle fabric arrays
+    if (dst_fabricarray)
+    {
+        size_t n = dst_fabricarray->size;
+        if (src_fabricarray)
+        {
+            // copy from fabric to fabric
+            if (src_fabricarray->size != n)
+            {
+                fprintf(stderr, "Warp copy error: Incompatible array sizes\n");
+                return 0;
+            }
+            array_copy_fabric_to_fabric(*dst_fabricarray, *src_fabricarray, elem_size);
+            return n;
+        }
+        else if (src_indexedfabricarray)
+        {
+            // copy from fabric indexed to fabric
+            if (src_indexedfabricarray->size != n)
+            {
+                fprintf(stderr, "Warp copy error: Incompatible array sizes\n");
+                return 0;
+            }
+            array_copy_fabric_indexed_to_fabric(*dst_fabricarray, *src_indexedfabricarray, elem_size);
+            return n;
+        }
+        else
+        {
+            // copy to fabric
+            if (size_t(src_shape[0]) != n)
+            {
+                fprintf(stderr, "Warp copy error: Incompatible array sizes\n");
+                return 0;
+            }
+            array_copy_to_fabric(*dst_fabricarray, src_data, src_strides[0], src_indices[0], elem_size);
+            return n;
+        }
+    }
+    else if (dst_indexedfabricarray)
+    {
+        size_t n = dst_indexedfabricarray->size;
+        if (src_fabricarray)
+        {
+            // copy from fabric to fabric indexed
+            if (src_fabricarray->size != n)
+            {
+                fprintf(stderr, "Warp copy error: Incompatible array sizes\n");
+                return 0;
+            }
+            array_copy_fabric_to_fabric_indexed(*dst_indexedfabricarray, *src_fabricarray, elem_size);
+            return n;
+        }
+        else if (src_indexedfabricarray)
+        {
+            // copy from fabric indexed to fabric indexed
+            if (src_indexedfabricarray->size != n)
+            {
+                fprintf(stderr, "Warp copy error: Incompatible array sizes\n");
+                return 0;
+            }
+            array_copy_fabric_indexed_to_fabric_indexed(*dst_indexedfabricarray, *src_indexedfabricarray, elem_size);
+            return n;
+        }
+        else
+        {
+            // copy to fabric indexed
+            if (size_t(src_shape[0]) != n)
+            {
+                fprintf(stderr, "Warp copy error: Incompatible array sizes\n");
+                return 0;
+            }
+            array_copy_to_fabric_indexed(*dst_indexedfabricarray, src_data, src_strides[0], src_indices[0], elem_size);
+            return n;
+        }
+    }
+    else if (src_fabricarray)
+    {
+        // copy from fabric
+        size_t n = src_fabricarray->size;
+        if (size_t(dst_shape[0]) != n)
+        {
+            fprintf(stderr, "Warp copy error: Incompatible array sizes\n");
+            return 0;
+        }
+        array_copy_from_fabric(*src_fabricarray, dst_data, dst_strides[0], dst_indices[0], elem_size);
+        return n;
+    }
+    else if (src_indexedfabricarray)
+    {
+        // copy from fabric indexed
+        size_t n = src_indexedfabricarray->size;
+        if (size_t(dst_shape[0]) != n)
+        {
+            fprintf(stderr, "Warp copy error: Incompatible array sizes\n");
+            return 0;
+        }
+        array_copy_from_fabric_indexed(*src_indexedfabricarray, dst_data, dst_strides[0], dst_indices[0], elem_size);
+        return n;
+    }
 
+    size_t n = 1;
     for (int i = 0; i < src_ndim; i++)
     {
         if (src_shape[i] != dst_shape[i])
         {
-            fprintf(stderr, "Warp error: Incompatible array shapes\n");
+            fprintf(stderr, "Warp copy error: Incompatible array shapes\n");
             return 0;
         }
         n *= src_shape[i];
@@ -269,15 +769,111 @@ WP_API size_t array_copy_host(void* dst, void* src, int dst_type, int src_type, 
               dst_indices, src_indices,
               src_shape, src_ndim, elem_size);
 
-    if (has_grad)
-    {
-        array_copy_nd(dst_grad, src_grad,
-                dst_strides, src_strides,
-                dst_indices, src_indices,
-                src_shape, src_ndim, elem_size);
-    }
-
     return n;
+}
+
+
+static void array_fill_strided(void* data, const int* shape, const int* strides, int ndim, const void* value, int value_size)
+{
+    if (ndim == 1)
+    {
+        char* p = (char*)data;
+        for (int i = 0; i < shape[0]; i++)
+        {
+            memcpy(p, value, value_size);
+            p += strides[0];
+        }
+    }
+    else
+    {
+        for (int i = 0; i < shape[0]; i++)
+        {
+            char* p = (char*)data + i * strides[0];
+            // recurse on next inner dimension
+            array_fill_strided(p, shape + 1, strides + 1, ndim - 1, value, value_size);
+        }
+    }
+}
+
+
+static void array_fill_indexed(void* data, const int* shape, const int* strides, const int*const* indices, int ndim, const void* value, int value_size)
+{
+    if (ndim == 1)
+    {
+        for (int i = 0; i < shape[0]; i++)
+        {
+            int idx = indices[0] ? indices[0][i] : i;
+            char* p = (char*)data + idx * strides[0];
+            memcpy(p, value, value_size);
+        }
+    }
+    else
+    {
+        for (int i = 0; i < shape[0]; i++)
+        {
+            int idx = indices[0] ? indices[0][i] : i;
+            char* p = (char*)data + idx * strides[0];
+            // recurse on next inner dimension
+            array_fill_indexed(p, shape + 1, strides + 1, indices + 1, ndim - 1, value, value_size);
+        }
+    }
+}
+
+
+static void array_fill_fabric(wp::fabricarray_t<void>& fa, const void* value_ptr, int value_size)
+{
+    for (size_t i = 0; i < fa.nbuckets; i++)
+    {
+        const wp::fabricbucket_t& bucket = fa.buckets[i];
+        size_t bucket_size = bucket.index_end - bucket.index_start;
+        memtile_host(bucket.ptr, value_ptr, value_size, bucket_size);
+    }
+}
+
+
+static void array_fill_fabric_indexed(wp::indexedfabricarray_t<void>& ifa, const void* value_ptr, int value_size)
+{
+    for (size_t i = 0; i < ifa.size; i++)
+    {
+        size_t idx = size_t(ifa.indices[i]);
+        if (idx < ifa.fa.size)
+        {
+            void* p = fabricarray_element_ptr(ifa.fa, idx, value_size);
+            memcpy(p, value_ptr, value_size);
+        }
+    }
+}
+
+
+WP_API void array_fill_host(void* arr_ptr, int arr_type, const void* value_ptr, int value_size)
+{
+    if (!arr_ptr || !value_ptr)
+        return;
+
+    if (arr_type == wp::ARRAY_TYPE_REGULAR)
+    {
+        wp::array_t<void>& arr = *static_cast<wp::array_t<void>*>(arr_ptr);
+        array_fill_strided(arr.data, arr.shape.dims, arr.strides, arr.ndim, value_ptr, value_size);
+    }
+    else if (arr_type == wp::ARRAY_TYPE_INDEXED)
+    {
+        wp::indexedarray_t<void>& ia = *static_cast<wp::indexedarray_t<void>*>(arr_ptr);
+        array_fill_indexed(ia.arr.data, ia.shape.dims, ia.arr.strides, ia.indices, ia.arr.ndim, value_ptr, value_size);
+    }
+    else if (arr_type == wp::ARRAY_TYPE_FABRIC)
+    {
+        wp::fabricarray_t<void>& fa = *static_cast<wp::fabricarray_t<void>*>(arr_ptr);
+        array_fill_fabric(fa, value_ptr, value_size);
+    }
+    else if (arr_type == wp::ARRAY_TYPE_FABRIC_INDEXED)
+    {
+        wp::indexedfabricarray_t<void>& ifa = *static_cast<wp::indexedfabricarray_t<void>*>(arr_ptr);
+        array_fill_fabric_indexed(ifa, value_ptr, value_size);
+    }
+    else
+    {
+        fprintf(stderr, "Warp fill error: Invalid array type id %d\n", arr_type);
+    }
 }
 
 
@@ -334,13 +930,17 @@ void memset_device(void* context, void* dest, int value, size_t n)
 {
 }
 
-void memtile_device(void* context, void* dest, void *src, size_t srcsize, size_t n)
+void memtile_device(void* context, void* dest, const void* src, size_t srcsize, size_t n)
 {
 }
 
 size_t array_copy_device(void* context, void* dst, void* src, int dst_type, int src_type, int elem_size)
 {
     return 0;
+}
+
+void array_fill_device(void* context, void* arr, int arr_type, const void* value, int value_size)
+{
 }
 
 WP_API int cuda_driver_version() { return 0; }
@@ -355,6 +955,7 @@ WP_API void cuda_device_primary_context_release(int ordinal) {}
 WP_API const char* cuda_device_get_name(int ordinal) { return NULL; }
 WP_API int cuda_device_get_arch(int ordinal) { return 0; }
 WP_API int cuda_device_is_uva(int ordinal) { return 0; }
+WP_API int cuda_device_is_memory_pool_supported() { return 0; }
 
 WP_API void* cuda_context_get_current() { return NULL; }
 WP_API void cuda_context_set_current(void* ctx) {}
@@ -366,6 +967,7 @@ WP_API void cuda_context_synchronize(void* context) {}
 WP_API uint64_t cuda_context_check(void* context) { return 0; }
 WP_API int cuda_context_get_device_ordinal(void* context) { return -1; }
 WP_API int cuda_context_is_primary(void* context) { return 0; }
+WP_API int cuda_context_is_memory_pool_supported(void* context) { return 0; }
 WP_API void* cuda_context_get_stream(void* context) { return NULL; }
 WP_API void cuda_context_set_stream(void* context, void* stream) {}
 WP_API int cuda_context_can_access_peer(void* context, void* peer_context) { return 0; }
@@ -397,8 +999,6 @@ WP_API size_t cuda_launch_kernel(void* context, void* kernel, size_t dim, void**
 WP_API void cuda_set_context_restore_policy(bool always_restore) {}
 WP_API int cuda_get_context_restore_policy() { return false; }
 
-WP_API void array_inner_device(uint64_t a, uint64_t b, uint64_t out, int len) {}
-WP_API void array_sum_device(uint64_t a, uint64_t out, int len) {}
 WP_API void array_scan_int_device(uint64_t in, uint64_t out, int len, bool inclusive) {}
 WP_API void array_scan_float_device(uint64_t in, uint64_t out, int len, bool inclusive) {}
 

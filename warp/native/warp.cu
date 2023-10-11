@@ -77,6 +77,7 @@ struct DeviceInfo
     char name[kNameLen] = "";
     int arch = 0;
     int is_uva = 0;
+    int is_memory_pool_supported = 0;
 };
 
 struct ContextInfo
@@ -126,6 +127,7 @@ int cuda_init()
                 g_devices[i].ordinal = i;
                 check_cu(cuDeviceGetName_f(g_devices[i].name, DeviceInfo::kNameLen, device));
                 check_cu(cuDeviceGetAttribute_f(&g_devices[i].is_uva, CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING, device));
+                check_cu(cuDeviceGetAttribute_f(&g_devices[i].is_memory_pool_supported, CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED, device));
                 int major = 0;
                 int minor = 0;
                 check_cu(cuDeviceGetAttribute_f(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
@@ -216,11 +218,45 @@ void* alloc_device(void* context, size_t s)
     return ptr;
 }
 
+void* alloc_temp_device(void* context, size_t s)
+{
+    // "cudaMallocAsync ignores the current device/context when determining where the allocation will reside. Instead,
+    // cudaMallocAsync determines the resident device based on the specified memory pool or the supplied stream."
+    ContextGuard guard(context);
+
+    void* ptr;
+
+    if (cuda_context_is_memory_pool_supported(context))
+    {
+        check_cuda(cudaMallocAsync(&ptr, s, get_current_stream()));
+    }
+    else
+    {
+        check_cuda(cudaMalloc(&ptr, s));
+    }
+
+    return ptr;
+}
+
 void free_device(void* context, void* ptr)
 {
     ContextGuard guard(context);
 
     check_cuda(cudaFree(ptr));
+}
+
+void free_temp_device(void* context, void* ptr)
+{
+    ContextGuard guard(context);
+
+    if (cuda_context_is_memory_pool_supported(context))
+    {
+        check_cuda(cudaFreeAsync(ptr, get_current_stream()));
+    }
+    else
+    {
+        check_cuda(cudaFree(ptr));
+    }
 }
 
 void memcpy_h2d(void* context, void* dest, void* src, size_t n)
@@ -276,6 +312,72 @@ void memset_device(void* context, void* dest, int value, size_t n)
         // custom kernel to support 4-byte values (and slightly lower host overhead)
         const size_t num_words = n/4;
         wp_launch_device(WP_CURRENT_CONTEXT, memset_kernel, num_words, ((int*)dest, value, num_words));
+    }
+}
+
+// fill memory buffer with a value: generic memtile kernel using memcpy for each element
+__global__ void memtile_kernel(void* dst, const void* src, size_t srcsize, size_t n)
+{
+    size_t tid = wp::grid_index();
+    if (tid < n)
+    {
+        memcpy((int8_t*)dst + srcsize * tid, src, srcsize);
+    }
+}
+
+// this should be faster than memtile_kernel, but requires proper alignment of dst
+template <typename T>
+__global__ void memtile_value_kernel(T* dst, T value, size_t n)
+{
+    size_t tid = wp::grid_index();
+    if (tid < n)
+    {
+        dst[tid] = value;
+    }
+}
+
+void memtile_device(void* context, void* dst, const void* src, size_t srcsize, size_t n)
+{
+    ContextGuard guard(context);
+
+    size_t dst_addr = reinterpret_cast<size_t>(dst);
+    size_t src_addr = reinterpret_cast<size_t>(src);
+
+    // try memtile_value first because it should be faster, but we need to ensure proper alignment
+    if (srcsize == 8 && (dst_addr & 7) == 0 && (src_addr & 7) == 0)
+    {
+        int64_t* p = reinterpret_cast<int64_t*>(dst);
+        int64_t value = *reinterpret_cast<const int64_t*>(src);
+        wp_launch_device(WP_CURRENT_CONTEXT, memtile_value_kernel, n, (p, value, n));
+    }
+    else if (srcsize == 4 && (dst_addr & 3) == 0 && (src_addr & 3) == 0)
+    {
+        int32_t* p = reinterpret_cast<int32_t*>(dst);
+        int32_t value = *reinterpret_cast<const int32_t*>(src);
+        wp_launch_device(WP_CURRENT_CONTEXT, memtile_value_kernel, n, (p, value, n));
+    }
+    else if (srcsize == 2 && (dst_addr & 1) == 0 && (src_addr & 1) == 0)
+    {
+        int16_t* p = reinterpret_cast<int16_t*>(dst);
+        int16_t value = *reinterpret_cast<const int16_t*>(src);
+        wp_launch_device(WP_CURRENT_CONTEXT, memtile_value_kernel, n, (p, value, n));
+    }
+    else if (srcsize == 1)
+    {
+        check_cuda(cudaMemset(dst, *reinterpret_cast<const int8_t*>(src), n));
+    }
+    else
+    {
+        // generic version
+
+        // TODO: use a persistent stream-local staging buffer to avoid allocs?
+        void* src_device;
+        check_cuda(cudaMalloc(&src_device, srcsize));
+        check_cuda(cudaMemcpyAsync(src_device, src, srcsize, cudaMemcpyHostToDevice, get_current_stream()));
+
+        wp_launch_device(WP_CURRENT_CONTEXT, memtile_kernel, n, (dst, src_device, srcsize, n));
+
+        check_cuda(cudaFree(src_device));
     }
 }
 
@@ -382,6 +484,125 @@ static __global__ void array_copy_4d_kernel(void* dst, const void* src,
 }
 
 
+static __global__ void array_copy_from_fabric_kernel(wp::fabricarray_t<void> src,
+                                                     void* dst_data, int dst_stride, const int* dst_indices,
+                                                     int elem_size)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid < src.size)
+    {
+        int dst_idx = dst_indices ? dst_indices[tid] : tid;
+        void* dst_ptr = (char*)dst_data + dst_idx * dst_stride;
+        const void* src_ptr = fabricarray_element_ptr(src, tid, elem_size);
+        memcpy(dst_ptr, src_ptr, elem_size);
+    }
+}
+
+static __global__ void array_copy_from_fabric_indexed_kernel(wp::indexedfabricarray_t<void> src,
+                                                             void* dst_data, int dst_stride, const int* dst_indices,
+                                                             int elem_size)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid < src.size)
+    {
+        int src_index = src.indices[tid];
+        int dst_idx = dst_indices ? dst_indices[tid] : tid;
+        void* dst_ptr = (char*)dst_data + dst_idx * dst_stride;
+        const void* src_ptr = fabricarray_element_ptr(src.fa, src_index, elem_size);
+        memcpy(dst_ptr, src_ptr, elem_size);
+    }
+}
+
+static __global__ void array_copy_to_fabric_kernel(wp::fabricarray_t<void> dst,
+                                                   const void* src_data, int src_stride, const int* src_indices,
+                                                   int elem_size)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid < dst.size)
+    {
+        int src_idx = src_indices ? src_indices[tid] : tid;
+        const void* src_ptr = (const char*)src_data + src_idx * src_stride;
+        void* dst_ptr = fabricarray_element_ptr(dst, tid, elem_size);
+        memcpy(dst_ptr, src_ptr, elem_size);
+    }
+}
+
+static __global__ void array_copy_to_fabric_indexed_kernel(wp::indexedfabricarray_t<void> dst,
+                                                           const void* src_data, int src_stride, const int* src_indices,
+                                                           int elem_size)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid < dst.size)
+    {
+        int src_idx = src_indices ? src_indices[tid] : tid;
+        const void* src_ptr = (const char*)src_data + src_idx * src_stride;
+        int dst_idx = dst.indices[tid];
+        void* dst_ptr = fabricarray_element_ptr(dst.fa, dst_idx, elem_size);
+        memcpy(dst_ptr, src_ptr, elem_size);
+    }
+}
+
+
+static __global__ void array_copy_fabric_to_fabric_kernel(wp::fabricarray_t<void> dst, wp::fabricarray_t<void> src, int elem_size)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid < dst.size)
+    {
+        const void* src_ptr = fabricarray_element_ptr(src, tid, elem_size);
+        void* dst_ptr = fabricarray_element_ptr(dst, tid, elem_size);
+        memcpy(dst_ptr, src_ptr, elem_size);
+    }
+}
+
+
+static __global__ void array_copy_fabric_to_fabric_indexed_kernel(wp::indexedfabricarray_t<void> dst, wp::fabricarray_t<void> src, int elem_size)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid < dst.size)
+    {
+        const void* src_ptr = fabricarray_element_ptr(src, tid, elem_size);
+        int dst_index = dst.indices[tid];
+        void* dst_ptr = fabricarray_element_ptr(dst.fa, dst_index, elem_size);
+        memcpy(dst_ptr, src_ptr, elem_size);
+    }
+}
+
+
+static __global__ void array_copy_fabric_indexed_to_fabric_kernel(wp::fabricarray_t<void> dst, wp::indexedfabricarray_t<void> src, int elem_size)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid < dst.size)
+    {
+        int src_index = src.indices[tid];
+        const void* src_ptr = fabricarray_element_ptr(src.fa, src_index, elem_size);
+        void* dst_ptr = fabricarray_element_ptr(dst, tid, elem_size);
+        memcpy(dst_ptr, src_ptr, elem_size);
+    }
+}
+
+
+static __global__ void array_copy_fabric_indexed_to_fabric_indexed_kernel(wp::indexedfabricarray_t<void> dst, wp::indexedfabricarray_t<void> src, int elem_size)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid < dst.size)
+    {
+        int src_index = src.indices[tid];
+        int dst_index = dst.indices[tid];
+        const void* src_ptr = fabricarray_element_ptr(src.fa, src_index, elem_size);
+        void* dst_ptr = fabricarray_element_ptr(dst.fa, dst_index, elem_size);
+        memcpy(dst_ptr, src_ptr, elem_size);
+    }
+}
+
+
 WP_API size_t array_copy_device(void* context, void* dst, void* src, int dst_type, int src_type, int elem_size)
 {
     if (!src || !dst)
@@ -399,6 +620,12 @@ WP_API size_t array_copy_device(void* context, void* dst, void* src, int dst_typ
     const int* dst_strides = NULL;
     const int*const* src_indices = NULL;
     const int*const* dst_indices = NULL;
+
+    const wp::fabricarray_t<void>* src_fabricarray = NULL;
+    wp::fabricarray_t<void>* dst_fabricarray = NULL;
+
+    const wp::indexedfabricarray_t<void>* src_indexedfabricarray = NULL;
+    wp::indexedfabricarray_t<void>* dst_indexedfabricarray = NULL;
 
     const int* null_indices[wp::ARRAY_MAX_DIMS] = { NULL };
 
@@ -421,9 +648,19 @@ WP_API size_t array_copy_device(void* context, void* dst, void* src, int dst_typ
         src_strides = src_arr.arr.strides;
         src_indices = src_arr.indices;
     }
+    else if (src_type == wp::ARRAY_TYPE_FABRIC)
+    {
+        src_fabricarray = static_cast<const wp::fabricarray_t<void>*>(src);
+        src_ndim = 1;
+    }
+    else if (src_type == wp::ARRAY_TYPE_FABRIC_INDEXED)
+    {
+        src_indexedfabricarray = static_cast<const wp::indexedfabricarray_t<void>*>(src);
+        src_ndim = 1;
+    }
     else
     {
-        fprintf(stderr, "Warp error: Invalid array type (%d)\n", src_type);
+        fprintf(stderr, "Warp copy error: Invalid array type (%d)\n", src_type);
         return 0;
     }
 
@@ -446,32 +683,148 @@ WP_API size_t array_copy_device(void* context, void* dst, void* src, int dst_typ
         dst_strides = dst_arr.arr.strides;
         dst_indices = dst_arr.indices;
     }
+    else if (dst_type == wp::ARRAY_TYPE_FABRIC)
+    {
+        dst_fabricarray = static_cast<wp::fabricarray_t<void>*>(dst);
+        dst_ndim = 1;
+    }
+    else if (dst_type == wp::ARRAY_TYPE_FABRIC_INDEXED)
+    {
+        dst_indexedfabricarray = static_cast<wp::indexedfabricarray_t<void>*>(dst);
+        dst_ndim = 1;
+    }
     else
     {
-        fprintf(stderr, "Warp error: Invalid array type (%d)\n", dst_type);
+        fprintf(stderr, "Warp copy error: Invalid array type (%d)\n", dst_type);
         return 0;
     }
 
     if (src_ndim != dst_ndim)
     {
-        fprintf(stderr, "Warp error: Incompatible array dimensionalities (%d and %d)\n", src_ndim, dst_ndim);
+        fprintf(stderr, "Warp copy error: Incompatible array dimensionalities (%d and %d)\n", src_ndim, dst_ndim);
         return 0;
     }
 
-    bool has_grad = (src_grad && dst_grad);
-    size_t n = 1;
+    ContextGuard guard(context);
 
+    // handle fabric arrays
+    if (dst_fabricarray)
+    {
+        size_t n = dst_fabricarray->size;
+        if (src_fabricarray)
+        {
+            // copy from fabric to fabric
+            if (src_fabricarray->size != n)
+            {
+                fprintf(stderr, "Warp copy error: Incompatible array sizes\n");
+                return 0;
+            }
+            wp_launch_device(WP_CURRENT_CONTEXT, array_copy_fabric_to_fabric_kernel, n,
+                            (*dst_fabricarray, *src_fabricarray, elem_size));
+            return n;
+        }
+        else if (src_indexedfabricarray)
+        {
+            // copy from fabric indexed to fabric
+            if (src_indexedfabricarray->size != n)
+            {
+                fprintf(stderr, "Warp copy error: Incompatible array sizes\n");
+                return 0;
+            }
+            wp_launch_device(WP_CURRENT_CONTEXT, array_copy_fabric_indexed_to_fabric_kernel, n,
+                            (*dst_fabricarray, *src_indexedfabricarray, elem_size));
+            return n;
+        }
+        else
+        {
+            // copy to fabric
+            if (size_t(src_shape[0]) != n)
+            {
+                fprintf(stderr, "Warp copy error: Incompatible array sizes\n");
+                return 0;
+            }
+            wp_launch_device(WP_CURRENT_CONTEXT, array_copy_to_fabric_kernel, n,
+                            (*dst_fabricarray, src_data, src_strides[0], src_indices[0], elem_size));
+            return n;
+        }
+    }
+    if (dst_indexedfabricarray)
+    {
+        size_t n = dst_indexedfabricarray->size;
+        if (src_fabricarray)
+        {
+            // copy from fabric to fabric indexed
+            if (src_fabricarray->size != n)
+            {
+                fprintf(stderr, "Warp copy error: Incompatible array sizes\n");
+                return 0;
+            }
+            wp_launch_device(WP_CURRENT_CONTEXT, array_copy_fabric_to_fabric_indexed_kernel, n,
+                            (*dst_indexedfabricarray, *src_fabricarray, elem_size));
+            return n;
+        }
+        else if (src_indexedfabricarray)
+        {
+            // copy from fabric indexed to fabric indexed
+            if (src_indexedfabricarray->size != n)
+            {
+                fprintf(stderr, "Warp copy error: Incompatible array sizes\n");
+                return 0;
+            }
+            wp_launch_device(WP_CURRENT_CONTEXT, array_copy_fabric_indexed_to_fabric_indexed_kernel, n,
+                            (*dst_indexedfabricarray, *src_indexedfabricarray, elem_size));
+            return n;
+        }
+        else
+        {
+            // copy to fabric indexed
+            if (size_t(src_shape[0]) != n)
+            {
+                fprintf(stderr, "Warp copy error: Incompatible array sizes\n");
+                return 0;
+            }
+            wp_launch_device(WP_CURRENT_CONTEXT, array_copy_to_fabric_indexed_kernel, n,
+                             (*dst_indexedfabricarray, src_data, src_strides[0], src_indices[0], elem_size));
+            return n;
+        }
+    }
+    else if (src_fabricarray)
+    {
+        // copy from fabric
+        size_t n = src_fabricarray->size;
+        if (size_t(dst_shape[0]) != n)
+        {
+            fprintf(stderr, "Warp copy error: Incompatible array sizes\n");
+            return 0;
+        }
+        wp_launch_device(WP_CURRENT_CONTEXT, array_copy_from_fabric_kernel, n,
+                         (*src_fabricarray, dst_data, dst_strides[0], dst_indices[0], elem_size));
+        return n;
+    }
+    else if (src_indexedfabricarray)
+    {
+        // copy from fabric indexed
+        size_t n = src_indexedfabricarray->size;
+        if (size_t(dst_shape[0]) != n)
+        {
+            fprintf(stderr, "Warp copy error: Incompatible array sizes\n");
+            return 0;
+        }
+        wp_launch_device(WP_CURRENT_CONTEXT, array_copy_from_fabric_indexed_kernel, n,
+                         (*src_indexedfabricarray, dst_data, dst_strides[0], dst_indices[0], elem_size));
+        return n;
+    }
+
+    size_t n = 1;
     for (int i = 0; i < src_ndim; i++)
     {
         if (src_shape[i] != dst_shape[i])
         {
-            fprintf(stderr, "Warp error: Incompatible array shapes\n");
+            fprintf(stderr, "Warp copy error: Incompatible array shapes\n");
             return 0;
         }
         n *= src_shape[i];
     }
-
-    ContextGuard guard(context);
 
     switch (src_ndim)
     {
@@ -481,13 +834,6 @@ WP_API size_t array_copy_device(void* context, void* dst, void* src, int dst_typ
                                                                    dst_strides[0], src_strides[0],
                                                                    dst_indices[0], src_indices[0],
                                                                    src_shape[0], elem_size));
-        if (has_grad)
-        {
-            wp_launch_device(WP_CURRENT_CONTEXT, array_copy_1d_kernel, n, (dst_grad, src_grad,
-                                                                       dst_strides[0], src_strides[0],
-                                                                       dst_indices[0], src_indices[0],
-                                                                       src_shape[0], elem_size));
-        }
         break;
     }
     case 2:
@@ -502,13 +848,6 @@ WP_API size_t array_copy_device(void* context, void* dst, void* src, int dst_typ
                                                                    dst_strides_v, src_strides_v,
                                                                    dst_indices_v, src_indices_v,
                                                                    shape_v, elem_size));
-        if (has_grad)
-        {
-            wp_launch_device(WP_CURRENT_CONTEXT, array_copy_2d_kernel, n, (dst_grad, src_grad,
-                                                                       dst_strides_v, src_strides_v,
-                                                                       dst_indices_v, src_indices_v,
-                                                                       shape_v, elem_size));
-        }
         break;
     }
     case 3:
@@ -523,13 +862,6 @@ WP_API size_t array_copy_device(void* context, void* dst, void* src, int dst_typ
                                                                    dst_strides_v, src_strides_v,
                                                                    dst_indices_v, src_indices_v,
                                                                    shape_v, elem_size));
-        if (has_grad)
-        {
-            wp_launch_device(WP_CURRENT_CONTEXT, array_copy_3d_kernel, n, (dst_grad, src_grad,
-                                                                       dst_strides_v, src_strides_v,
-                                                                       dst_indices_v, src_indices_v,
-                                                                       shape_v, elem_size));
-        }
         break;
     }
     case 4:
@@ -544,17 +876,10 @@ WP_API size_t array_copy_device(void* context, void* dst, void* src, int dst_typ
                                                                    dst_strides_v, src_strides_v,
                                                                    dst_indices_v, src_indices_v,
                                                                    shape_v, elem_size));
-        if (has_grad)
-        {
-            wp_launch_device(WP_CURRENT_CONTEXT, array_copy_4d_kernel, n, (dst_grad, src_grad,
-                                                                       dst_strides_v, src_strides_v,
-                                                                       dst_indices_v, src_indices_v,
-                                                                       shape_v, elem_size));
-        }
         break;
     }
     default:
-        fprintf(stderr, "Warp error: invalid array dimensionality (%d)\n", src_ndim);
+        fprintf(stderr, "Warp copy error: invalid array dimensionality (%d)\n", src_ndim);
         return 0;
     }
 
@@ -565,43 +890,231 @@ WP_API size_t array_copy_device(void* context, void* dst, void* src, int dst_typ
 }
 
 
-__global__ void memtile_kernel(char* dest, char* src, size_t srcsize, size_t n)
+static __global__ void array_fill_1d_kernel(void* data,
+                                            int n,
+                                            int stride,
+                                            const int* indices,
+                                            const void* value,
+                                            int value_size)
 {
-    const size_t tid = wp::grid_index();
-    
-    if (tid < n)
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
     {
-        char *d = dest + srcsize * tid;
-        char *s = src;
-        for( size_t i=0; i < srcsize; ++i,++d,++s )
+        int idx = indices ? indices[i] : i;
+        char* p = (char*)data + idx * stride;
+        memcpy(p, value, value_size);
+    }
+}
+
+static __global__ void array_fill_2d_kernel(void* data,
+                                            wp::vec_t<2, int> shape,
+                                            wp::vec_t<2, int> strides,
+                                            wp::vec_t<2, const int*> indices,
+                                            const void* value,
+                                            int value_size)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = shape[1];
+    int i = tid / n;
+    int j = tid % n;
+    if (i < shape[0] /*&& j < shape[1]*/)
+    {
+        int idx0 = indices[0] ? indices[0][i] : i;
+        int idx1 = indices[1] ? indices[1][j] : j;
+        char* p = (char*)data + idx0 * strides[0] + idx1 * strides[1];
+        memcpy(p, value, value_size);
+    }
+}
+
+static __global__ void array_fill_3d_kernel(void* data,
+                                            wp::vec_t<3, int> shape,
+                                            wp::vec_t<3, int> strides,
+                                            wp::vec_t<3, const int*> indices,
+                                            const void* value,
+                                            int value_size)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = shape[1];
+    int o = shape[2];
+    int i = tid / (n * o);
+    int j = tid % (n * o) / o;
+    int k = tid % o;
+    if (i < shape[0] && j < shape[1] /*&& k < shape[2]*/)
+    {
+        int idx0 = indices[0] ? indices[0][i] : i;
+        int idx1 = indices[1] ? indices[1][j] : j;
+        int idx2 = indices[2] ? indices[2][k] : k;
+        char* p = (char*)data + idx0 * strides[0] + idx1 * strides[1] + idx2 * strides[2];
+        memcpy(p, value, value_size);
+    }
+}
+
+static __global__ void array_fill_4d_kernel(void* data,
+                                            wp::vec_t<4, int> shape,
+                                            wp::vec_t<4, int> strides,
+                                            wp::vec_t<4, const int*> indices,
+                                            const void* value,
+                                            int value_size)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = shape[1];
+    int o = shape[2];
+    int p = shape[3];
+    int i = tid / (n * o * p);
+    int j = tid % (n * o * p) / (o * p);
+    int k = tid % (o * p) / p;
+    int l = tid % p;
+    if (i < shape[0] && j < shape[1] && k < shape[2] /*&& l < shape[3]*/)
+    {
+        int idx0 = indices[0] ? indices[0][i] : i;
+        int idx1 = indices[1] ? indices[1][j] : j;
+        int idx2 = indices[2] ? indices[2][k] : k;
+        int idx3 = indices[3] ? indices[3][l] : l;
+        char* p = (char*)data + idx0 * strides[0] + idx1 * strides[1] + idx2 * strides[2] + idx3 * strides[3];
+        memcpy(p, value, value_size);
+    }
+}
+
+
+static __global__ void array_fill_fabric_kernel(wp::fabricarray_t<void> fa, const void* value, int value_size)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < fa.size)
+    {
+        void* dst_ptr = fabricarray_element_ptr(fa, tid, value_size);
+        memcpy(dst_ptr, value, value_size);
+    }
+}
+
+
+static __global__ void array_fill_fabric_indexed_kernel(wp::indexedfabricarray_t<void> ifa, const void* value, int value_size)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < ifa.size)
+    {
+        size_t idx = size_t(ifa.indices[tid]);
+        if (idx < ifa.fa.size)
         {
-            *d = *s;
+            void* dst_ptr = fabricarray_element_ptr(ifa.fa, idx, value_size);
+            memcpy(dst_ptr, value, value_size);
         }
     }
 }
 
-void memtile_device(void* context, void* dest, void *src, size_t srcsize, size_t n)
+
+WP_API void array_fill_device(void* context, void* arr_ptr, int arr_type, const void* value_ptr, int value_size)
 {
+    if (!arr_ptr || !value_ptr)
+        return;
+
+    void* data = NULL;
+    int ndim = 0;
+    const int* shape = NULL;
+    const int* strides = NULL;
+    const int*const* indices = NULL;
+
+    wp::fabricarray_t<void>* fa = NULL;
+    wp::indexedfabricarray_t<void>* ifa = NULL;
+
+    const int* null_indices[wp::ARRAY_MAX_DIMS] = { NULL };
+
+    if (arr_type == wp::ARRAY_TYPE_REGULAR)
+    {
+        wp::array_t<void>& arr = *static_cast<wp::array_t<void>*>(arr_ptr);
+        data = arr.data;
+        ndim = arr.ndim;
+        shape = arr.shape.dims;
+        strides = arr.strides;
+        indices = null_indices;
+    }
+    else if (arr_type == wp::ARRAY_TYPE_INDEXED)
+    {
+        wp::indexedarray_t<void>& ia = *static_cast<wp::indexedarray_t<void>*>(arr_ptr);
+        data = ia.arr.data;
+        ndim = ia.arr.ndim;
+        shape = ia.shape.dims;
+        strides = ia.arr.strides;
+        indices = ia.indices;
+    }
+    else if (arr_type == wp::ARRAY_TYPE_FABRIC)
+    {
+        fa = static_cast<wp::fabricarray_t<void>*>(arr_ptr);
+    }
+    else if (arr_type == wp::ARRAY_TYPE_FABRIC_INDEXED)
+    {
+        ifa = static_cast<wp::indexedfabricarray_t<void>*>(arr_ptr);
+    }
+    else
+    {
+        fprintf(stderr, "Warp fill error: Invalid array type id %d\n", arr_type);
+        return;
+    }
+
+    size_t n = 1;
+    for (int i = 0; i < ndim; i++)
+        n *= shape[i];
+
     ContextGuard guard(context);
 
-    void* src_device;
-    check_cuda(cudaMalloc(&src_device, srcsize));
-    check_cuda(cudaMemcpyAsync(src_device, src, srcsize, cudaMemcpyHostToDevice, get_current_stream()));
+    // copy value to device memory
+    void* value_devptr;
+    check_cuda(cudaMalloc(&value_devptr, value_size));
+    check_cuda(cudaMemcpyAsync(value_devptr, value_ptr, value_size, cudaMemcpyHostToDevice, get_current_stream()));
 
-    wp_launch_device(WP_CURRENT_CONTEXT, memtile_kernel, n, ((char *)dest,(char *)src_device,srcsize,n));
+    // handle fabric arrays
+    if (fa)
+    {
+        wp_launch_device(WP_CURRENT_CONTEXT, array_fill_fabric_kernel, n,
+                         (*fa, value_devptr, value_size));
+        return;
+    }
+    else if (ifa)
+    {
+        wp_launch_device(WP_CURRENT_CONTEXT, array_fill_fabric_indexed_kernel, n,
+                         (*ifa, value_devptr, value_size));
+        return;
+    }
 
-    check_cuda(cudaFree(src_device));
-}
-
-
-void array_inner_device(uint64_t a, uint64_t b, uint64_t out, int len)
-{
-
-}
-
-void array_sum_device(uint64_t a, uint64_t out, int len)
-{
-    
+    // handle regular or indexed arrays
+    switch (ndim)
+    {
+    case 1:
+    {
+        wp_launch_device(WP_CURRENT_CONTEXT, array_fill_1d_kernel, n,
+                         (data, shape[0], strides[0], indices[0], value_devptr, value_size));
+        break;
+    }
+    case 2:
+    {
+        wp::vec_t<2, int> shape_v(shape[0], shape[1]);
+        wp::vec_t<2, int> strides_v(strides[0], strides[1]);
+        wp::vec_t<2, const int*> indices_v(indices[0], indices[1]);
+        wp_launch_device(WP_CURRENT_CONTEXT, array_fill_2d_kernel, n,
+                         (data, shape_v, strides_v, indices_v, value_devptr, value_size));
+        break;
+    }
+    case 3:
+    {
+        wp::vec_t<3, int> shape_v(shape[0], shape[1], shape[2]);
+        wp::vec_t<3, int> strides_v(strides[0], strides[1], strides[2]);
+        wp::vec_t<3, const int*> indices_v(indices[0], indices[1], indices[2]);
+        wp_launch_device(WP_CURRENT_CONTEXT, array_fill_3d_kernel, n,
+                         (data, shape_v, strides_v, indices_v, value_devptr, value_size));
+        break;
+    }
+    case 4:
+    {
+        wp::vec_t<4, int> shape_v(shape[0], shape[1], shape[2], shape[3]);
+        wp::vec_t<4, int> strides_v(strides[0], strides[1], strides[2], strides[3]);
+        wp::vec_t<4, const int*> indices_v(indices[0], indices[1], indices[2], indices[3]);
+        wp_launch_device(WP_CURRENT_CONTEXT, array_fill_4d_kernel, n,
+                         (data, shape_v, strides_v, indices_v, value_devptr, value_size));
+        break;
+    }
+    default:
+        fprintf(stderr, "Warp fill error: invalid array dimensionality (%d)\n", ndim);
+        return;
+    }
 }
 
 void array_scan_int_device(uint64_t in, uint64_t out, int len, bool inclusive)
@@ -687,6 +1200,13 @@ int cuda_device_is_uva(int ordinal)
     if (ordinal >= 0 && ordinal < int(g_devices.size()))
         return g_devices[ordinal].is_uva;
     return 0;
+}
+
+int cuda_device_is_memory_pool_supported(int ordinal)
+{
+    if (ordinal >= 0 && ordinal < int(g_devices.size()))
+        return g_devices[ordinal].is_memory_pool_supported;
+    return false;
 }
 
 void* cuda_context_get_current()
@@ -793,6 +1313,16 @@ int cuda_context_is_primary(void* context)
         void* device_primary_context = cuda_device_primary_context_retain(ordinal);
         cuda_device_primary_context_release(ordinal);
         return int(context == device_primary_context);
+    }
+    return 0;
+}
+
+int cuda_context_is_memory_pool_supported(void* context)
+{
+    int ordinal = cuda_context_get_device_ordinal(context);
+    if (ordinal != -1)
+    {
+        return cuda_device_is_memory_pool_supported(ordinal);
     }
     return 0;
 }
@@ -1006,10 +1536,10 @@ void* cuda_graph_end_capture(void* context)
         //cudaGraphDebugDotPrint(graph, "graph.dot", cudaGraphDebugDotFlagsVerbose);
 
         cudaGraphExec_t graph_exec = NULL;
-        check_cuda(cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0));
+        //check_cuda(cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0));
         
         // can use after CUDA 11.4 to permit graphs to capture cudaMallocAsync() operations
-        //check_cuda(cudaGraphInstantiateWithFlags(&graph_exec, graph, cudaGraphInstantiateFlagAutoFreeOnLaunch));
+        check_cuda(cudaGraphInstantiateWithFlags(&graph_exec, graph, cudaGraphInstantiateFlagAutoFreeOnLaunch));
 
         // free source graph
         check_cuda(cudaGraphDestroy(graph));
@@ -1064,10 +1594,8 @@ size_t cuda_compile_program(const char* cuda_src, int arch, const char* include_
 
     std::vector<const char*> opts;
     opts.push_back(arch_opt);
-    opts.push_back(include_opt);    
-    opts.push_back("--device-as-default-execution-space");
+    opts.push_back(include_opt);
     opts.push_back("--std=c++11");
-    opts.push_back("--define-macro=WP_CUDA");
     
     if (debug)
     {
@@ -1193,7 +1721,7 @@ void* cuda_load_module(void* context, const char* path)
         size_t length = ftell(file);
         fseek(file, 0, SEEK_SET);
 
-        input.resize(length);
+        input.resize(length + 1);
         if (fread(input.data(), 1, length, file) != length)
         {
             fprintf(stderr, "Warp error: Failed to read input file '%s'\n", path);
@@ -1201,6 +1729,8 @@ void* cuda_load_module(void* context, const char* path)
             return NULL;
         }
         fclose(file);
+
+        input[length] = '\0';
     }
     else
     {
@@ -1306,7 +1836,7 @@ void* cuda_get_kernel(void* context, void* module, const char* name)
 
     CUfunction kernel = NULL;
     if (!check_cu(cuModuleGetFunction_f(&kernel, (CUmodule)module, name)))
-        printf("Warp: Failed to lookup kernel function %s in module\n", name);
+        fprintf(stderr, "Warp CUDA error: Failed to lookup kernel function %s in module\n", name);
 
     return kernel;
 }
@@ -1384,8 +1914,11 @@ void cuda_graphics_unregister_resource(void* context, void* resource)
 #include "mesh.cu"
 #include "sort.cu"
 #include "hashgrid.cu"
+#include "reduce.cu"
+#include "runlength_encode.cu"
 #include "scan.cu"
 #include "marching.cu"
+#include "sparse.cu"
 #include "volume.cu"
 #include "volume_builder.cu"
 #if WP_ENABLE_CUTLASS
