@@ -28,8 +28,10 @@ cuda_output = (
     None  # preferred CUDA output format for kernels ("ptx" or "cubin"), determined automatically if unspecified
 )
 
-ptx_target_arch = 70  # target architecture for PTX generation, defaults to the lowest architecture that supports all of Warp's features
+ptx_target_arch = 60  # target architecture for PTX generation, defaults to the lowest architecture that supports all of Warp's features
 
 enable_backward = True  # whether to compiler the backward passes of the kernels
 
 llvm_cuda = False  # use Clang/LLVM instead of NVRTC to compile CUDA
+
+build = False  # whether to build the kernels

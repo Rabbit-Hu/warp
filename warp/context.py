@@ -1163,7 +1163,8 @@ class Module:
             "max_unroll": 16,
             "enable_backward": warp.config.enable_backward,
             "fast_math": False,
-            "cuda_output": None,  # supported values: "ptx", "cubin", or None (automatic)
+            # "cuda_output": None,  # supported values: "ptx", "cubin", or None (automatic)
+            "cuda_output": "ptx",
             "mode": warp.config.mode,
         }
 
@@ -1354,6 +1355,7 @@ class Module:
         device = get_device(device)
 
         if device.is_cpu:
+            raise RuntimeError("CPU module loading is not supported")
             # check if already loaded
             if self.cpu_module:
                 return True
@@ -1459,16 +1461,24 @@ class Module:
 
                 cuda_hash_path = module_path + f".sm{output_arch}.hash"
 
-                # check cache
-                if warp.config.cache_kernels and os.path.isfile(cuda_hash_path) and os.path.isfile(output_path):
-                    with open(cuda_hash_path, "rb") as f:
-                        cache_hash = f.read()
+                load_existing = False
+                if warp.config.build:
+                    # check cache
+                    if warp.config.cache_kernels and os.path.isfile(cuda_hash_path) and os.path.isfile(output_path):
+                        with open(cuda_hash_path, "rb") as f:
+                            cache_hash = f.read()
 
-                    if cache_hash == module_hash:
-                        cuda_module = warp.build.load_cuda(output_path, device)
-                        if cuda_module is not None:
-                            self.cuda_modules[device.context] = cuda_module
-                            return True
+                        if cache_hash == module_hash:
+                            load_existing = True
+                else:
+                    # always load existing if we're not building
+                    load_existing = True
+
+                if load_existing:
+                    cuda_module = warp.build.load_cuda(output_path, device)
+                    if cuda_module is not None:
+                        self.cuda_modules[device.context] = cuda_module
+                        return True
 
                 # build
                 try:
