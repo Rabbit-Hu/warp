@@ -5,6 +5,9 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
+
+import os
+
 version = "1.0.0-beta.2"
 
 cuda_path = (
@@ -22,7 +25,8 @@ quiet = False  # suppress all output except errors and warnings
 host_compiler = None  # user can specify host compiler here, otherwise will attempt to find one automatically
 
 cache_kernels = True
-kernel_cache_dir = None  # path to kernel cache directory, if None a default path will be used
+# kernel_cache_dir = None  # path to kernel cache directory, if None a default path will be used
+kernel_cache_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "build"))
 
 cuda_output = (
     None  # preferred CUDA output format for kernels ("ptx" or "cubin"), determined automatically if unspecified
